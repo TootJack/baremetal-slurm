@@ -410,10 +410,34 @@ if [[ -n "$NODE2_HOST" ]]; then
   # itself; we read that. No ssh required - it is on shared storage.
   node2_line="$(fetch_remote_node_line "$NODE2_HOST")"
   if [[ -n "$node2_line" ]]; then
+    # A published line only describes node 2 as it was when 04 last ran. If 04
+    # ran BEFORE a fix to the detection logic (or before its hardware changed)
+    # the line is stale, and a stale line silently reintroduces the exact
+    # INVALID_REG we are fixing - e.g. one without CoresPerSocket makes
+    # slurmctld assume socket 0 = core 0. Compare against what the CURRENT
+    # logic would produce and require freshness.
+    cfg="$(cluster_stage_dir)/node-${NODE2_HOST}.conf"
+    age_s=$(( $(date +%s) - $(stat -c %Y "$cfg" 2>/dev/null || echo 0) ))
+    if ! grep -q "CoresPerSocket=" <<<"$node2_line" \
+       && ! grep -q "SocketsPerBoard=" <<<"$node2_line"; then
+      echo
+      echo "    !! ${NODE2_HOST}'s published line has NO CPU topology:"
+      echo "         ${node2_line}"
+      echo "       That is a STALE line, written by an older version of 04."
+      echo "       Without CoresPerSocket, slurmctld assumes 1 and rejects the"
+      echo "       node as INVALID_REG:"
+      echo "         Reason=gres/gpu GRES autodetected core affinity ... doesn't"
+      echo "         match socket boundaries. (Socket 0 is cores 0-0)."
+      echo "       On ${NODE2_HOST}, re-run to republish:"
+      echo "           sudo bash 04-slurm-compute.sh"
+      echo "       then re-run this script."
+      echo
+      exit 1
+    fi
+    echo "    ${NODE2_HOST} line read from shared storage (${age_s}s old):"
+    sed 's/^/      /' <<<"$node2_line"
     NODE_LINES="${NODE_LINES}
 ${node2_line}"
-    echo "    ${NODE2_HOST} line read from shared storage:"
-    sed 's/^/      /' <<<"$node2_line"
   else
     # Refuse to invent it. Getting this wrong produces exactly the failure we
     # saw: the node registers with different resources and slurmctld marks it
@@ -710,7 +734,19 @@ if sinfo -N -h -o "%N %T" 2>/dev/null | grep -qiE '\binval\b|\bdrain'; then
       echo "        this machine reports (slurmd -C):"
       slurmd -C 2>/dev/null | grep -m1 '^NodeName=' | sed 's/^ */          /'
       echo "        NVML visibility for slurmd (slurmd -G):"
-      slurmd -G 2>&1 | head -4 | sed 's/^ */          /'
+      # `slurmd -G` tries to set up a cgroup, which CONFLICTS with the running
+      # slurmd and prints "Unable to initialize cgroup plugin" - that noise is
+      # unrelated to GPU detection, so keep the GPU-relevant lines and say so
+      # rather than letting the user chase a cgroup red herring.
+      gg="$(slurmd -G 2>&1 || true)"
+      if grep -qE 'Gres Name=|device\(s\) detected|lib wasn' <<<"$gg"; then
+        grep -E 'Gres Name=|device\(s\) detected|lib wasn' <<<"$gg" \
+          | head -4 | sed 's/^ */          /'
+      else
+        echo "          (could not read GPU list - slurmd -G collides with the"
+        echo "           running slurmd's cgroup; this is NOT a GPU problem)"
+        grep -iE 'Permission denied|cgroup' <<<"$gg" | head -2 | sed 's/^ */          /'
+      fi
     fi
   done
   echo

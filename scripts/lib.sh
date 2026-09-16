@@ -291,20 +291,50 @@ gpu_type_and_count() {
 # about the host we are running on. Labelling another host's name with local
 # hardware produces a config slurmd rejects on registration. Use
 # fetch_remote_node_line() to obtain another node's own line.
+#
+# The CPU TOPOLOGY fields must be carried through, not just CPUs/RealMemory.
+# `slurmd -C` emits Boards/SocketsPerBoard/CoresPerSocket/ThreadsPerCore, and
+# slurmctld uses them to validate GRES core affinity. If CoresPerSocket is
+# omitted slurmctld assumes 1, so "socket 0" becomes "core 0" while NVML
+# reports each GPU attached to a wide core range, and registration fails with:
+#   Reason=gres/gpu GRES autodetected core affinity 0-95 on node hgx01 doesn't
+#   match socket boundaries. (Socket 0 is cores 0-0).
+#   State=IDLE+DRAIN+INVALID_REG
+# So build the line from slurmd's own output rather than re-serialising a
+# subset of it.
 detect_node() {   # $1 = hostname this machine IS
-  local host="$1" line cpus mem gres="" gtype="" gcount=""
+  local host="$1" line rest gres="" gtype="" gcount=""
   line="$(slurmd -C 2>/dev/null | grep -m1 '^NodeName=' || true)"
+
   if [[ -n "$line" ]]; then
-    cpus="$(sed -E 's/.*CPUs=([0-9]+).*/\1/' <<<"$line")"
-    mem="$(sed -E 's/.*RealMemory=([0-9]+).*/\1/' <<<"$line")"
+    # Everything after NodeName=<local-name>, minus State= (not emitted by
+    # slurmd -C, and we always set it) so the topology stays verbatim.
+    rest="$(sed -E 's/^NodeName=[^[:space:]]+[[:space:]]*//' <<<"$line")"
+    rest="$(sed -E 's/[[:space:]]*State=[^[:space:]]+//g' <<<"$rest")"
+
+    # slurmd already reports Gres= when it can see the GPUs via NVML - that is
+    # the authoritative value slurmctld compares against, so keep it as-is.
+    if grep -q 'Gres=' <<<"$rest"; then
+      gres=""
+    else
+      read -r gtype gcount <<<"$(gpu_type_and_count)"
+      if [[ -n "$gtype" && -n "$gcount" ]]; then
+        gres=" Gres=gpu:${gtype}:${gcount}"
+      fi
+    fi
   else
-    cpus="$(nproc)"; mem="$(( $(awk '/MemTotal/{print $2}' /proc/meminfo) / 1024 ))"
+    # slurmd -C produced nothing: fall back to the bare minimum, but say so -
+    # a line without topology can be rejected as INVALID_REG on GPU nodes.
+    rest="CPUs=$(nproc) RealMemory=$(( $(awk '/MemTotal/{print $2}' /proc/meminfo) / 1024 ))"
+    read -r gtype gcount <<<"$(gpu_type_and_count)"
+    if [[ -n "$gtype" && -n "$gcount" ]]; then
+      gres=" Gres=gpu:${gtype}:${gcount}"
+    fi
+    echo "    !! slurmd -C produced no NodeName line; falling back to a" >&2
+    echo "       CPU/memory-only stanza, which may be rejected on GPU nodes" >&2
   fi
-  read -r gtype gcount <<<"$(gpu_type_and_count)"
-  if [[ -n "$gtype" && -n "$gcount" ]]; then
-    gres=" Gres=gpu:${gtype}:${gcount}"
-  fi
-  echo "NodeName=${host} CPUs=${cpus} RealMemory=${mem}${gres} State=UNKNOWN"
+
+  echo "NodeName=${host} ${rest}${gres} State=UNKNOWN"
 }
 
 # Read node $1's own NodeName line from shared storage, where 04 publishes
