@@ -181,20 +181,68 @@ if [[ -d /etc/systemd/system/munge.service.d ]]; then
   systemctl daemon-reload
 fi
 
+# Belt-and-braces: we could not identify how the vendor pinned
+# --key-file=/cm/shared/... (it survived rewriting /etc/default/munge and
+# clearing drop-ins). Rather than keep guessing, create our OWN full unit
+# that cannot be overridden by any EnvironmentFile or OPTIONS variable.
+cat > /etc/systemd/system/munge.service <<'EOF'
+[Unit]
+Description=MUNGE authentication service (i3D POC - pinned key path)
+Documentation=man:munged(8)
+After=time-sync.target
+
+[Service]
+Type=forking
+# NOTE: deliberately no EnvironmentFile and no $OPTIONS - the vendor stack
+# left OPTIONS pointing at /cm/shared/apps/... and the distro unit expands
+# $OPTIONS, which overrode our key and broke all Slurm authentication.
+ExecStart=/usr/sbin/munged --key-file=/etc/munge/munge.key
+PIDFile=/run/munge/munged.pid
+RuntimeDirectory=munge
+RuntimeDirectoryMode=0755
+User=munge
+Group=munge
+Restart=on-abort
+
+[Install]
+WantedBy=multi-user.target
+EOF
+# any EnvironmentFile the unit might still pull in is now ignored, but blank
+# it anyway so nothing else can inject a stale key path
+: > /etc/default/munge 2>/dev/null || true
+systemctl daemon-reload
+
 if [[ ! -s /etc/munge/munge.key ]]; then
   dd if=/dev/urandom bs=1 count=1024 of=/etc/munge/munge.key 2>/dev/null
 fi
 chown munge:munge /etc/munge/munge.key
 chmod 400 /etc/munge/munge.key
+
+# Sanity-check the key path BEFORE starting: a vendor --key-file pointing at
+# /cm/shared/apps/... is the #1 cause of munge failing on these nodes.
+grep -qE '^\s*OPTIONS=.*--key-file=/cm/' /etc/default/munge 2>/dev/null && {
+  echo "    !! /etc/default/munge still references a vendor key path"
+}
+
 systemctl reset-failed munge 2>/dev/null || true
 systemctl enable munge >/dev/null 2>&1 || true
-systemctl restart munge
+# `|| true` is REQUIRED: systemctl restart returns non-zero when the unit
+# fails, and under `set -e` that aborted the script before the diagnostics
+# below could print - which is why this failure looked silent.
+systemctl restart munge 2>/dev/null || true
 sleep 2
-if ! munge -n | unmunge 2>/dev/null | grep -q "STATUS:.*Success"; then
-  echo "    !! munge failed to start. Diagnostics:"
-  systemctl status munge --no-pager 2>/dev/null | head -12
-  journalctl -u munge -n 10 --no-pager 2>/dev/null | tail -10
-  echo "    Check /etc/default/munge has no stale vendor --key-file."
+if ! munge -n 2>/dev/null | unmunge 2>/dev/null | grep -q "STATUS:.*Success"; then
+  echo
+  echo "    !! munge is not working - the cluster cannot authenticate without it."
+  echo "       --- systemctl status ---"
+  systemctl status munge --no-pager 2>/dev/null | head -12 | sed 's/^/       /'
+  echo "       --- journal ---"
+  journalctl -u munge -n 8 --no-pager 2>/dev/null | tail -8 | sed 's/^/       /'
+  echo "       --- effective config ---"
+  echo "       /etc/default/munge : $(grep -E '^\s*OPTIONS=' /etc/default/munge 2>/dev/null || echo '(none)')"
+  echo "       key in place      : $(ls -l /etc/munge/munge.key 2>/dev/null || echo MISSING)"
+  echo "       If OPTIONS shows a /cm/ path, that is the vendor key and it must"
+  echo "       be /etc/munge/munge.key instead."
   exit 1
 fi
 echo "    munge OK (key: /etc/munge/munge.key)"
@@ -495,7 +543,11 @@ chown -R root:root /var/spool/slurmctld /var/spool/slurmd
 # ClusterName ("fatal: CLUSTER NAME MISMATCH"). That happens when this script
 # is re-run against an old state dir. Detect and clear it.
 if [[ -f /var/spool/slurmctld/clustername ]]; then
-  OLD_NAME="$(cat /var/spool/slurmctld/clustername 2>/dev/null | tr -d '[:space:]')"
+  # Slurm writes "<ClusterName>|<version>", e.g. "i3dpoc|1632" - comparing
+  # the raw contents against ClusterName always mismatched and archived the
+  # state dir on every run. Strip the version suffix.
+  OLD_NAME="$(cat /var/spool/slurmctld/clustername 2>/dev/null \
+              | tr -d '[:space:]' | cut -d'|' -f1)"
   if [[ -n "$OLD_NAME" && "$OLD_NAME" != "$CLUSTER_NAME" ]]; then
     echo "    !! state dir holds cluster '${OLD_NAME}', we want '${CLUSTER_NAME}'"
     echo "       archiving old state so slurmctld can start"

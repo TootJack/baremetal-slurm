@@ -294,3 +294,46 @@ grep -rl "/cm/" /etc/slurm /etc/default /etc/systemd/system 2>/dev/null
 With the vendor `OPTIONS` **and** a stale drop-in planted, `03` completes
 `EXIT=0`, prints `vendor munge OPTIONS found … munge OK`, and all five
 daemons end active with the node `idle`.
+
+## The munge vendor trap — SOLVED (definitively)
+
+hgx01 kept failing even after rewriting `/etc/default/munge`:
+
+```
+Process: ExecStart=/usr/sbin/munged --key-file=/cm/shared/apps/slurm/var/munge/keys/munge.key
+```
+
+The vendor `--key-file` survived every attempt to neutralise it via
+`/etc/default/munge`, because **we could not identify which layer injected
+it**. Guessing was the wrong approach.
+
+### Fix: replace the unit outright
+
+`03`/`04` now write a complete `/etc/systemd/system/munge.service` that
+**has no `EnvironmentFile` and does not expand `$OPTIONS`**:
+
+```ini
+ExecStart=/usr/sbin/munged --key-file=/etc/munge/munge.key
+```
+
+Nothing the vendor left behind can override a hardcoded ExecStart.
+
+*Verified against a hostile state:* `OPTIONS` in `/etc/default/munge`
+**plus** a drop-in injecting `Environment=OPTIONS=...` →
+before: `failed` (effective `ExecStart=... $OPTIONS`);
+after: `active`, `STATUS: Success`.
+
+### Also fixed while proving it
+
+| Bug | Symptom |
+|---|---|
+| bare `systemctl restart munge` under `set -e` | **aborted the script before diagnostics could print** — which is why the failure looked silent |
+| `clustername` compared to raw file contents | Slurm stores `i3dpoc\|1632`, so the guard archived state every run → `slurmctld activating` |
+
+Verified end state with the vendor config planted:
+
+```
+munge active | mariadb active | slurmdbd active | slurmctld active | slurmd active
+[node] idle
+EXIT=0
+```

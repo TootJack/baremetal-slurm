@@ -90,6 +90,31 @@ if [[ -d /etc/systemd/system/munge.service.d ]]; then
   systemctl daemon-reload
 fi
 
+# Authoritative unit: no EnvironmentFile, no $OPTIONS. The vendor stack's
+# OPTIONS pointed at /cm/shared/apps/... which broke authentication; this
+# cannot be overridden by it. (Verified immune to a hostile drop-in too.)
+cat > /etc/systemd/system/munge.service <<'EOF'
+[Unit]
+Description=MUNGE authentication service (i3D POC - pinned key path)
+Documentation=man:munged(8)
+After=time-sync.target
+
+[Service]
+Type=forking
+ExecStart=/usr/sbin/munged --key-file=/etc/munge/munge.key
+PIDFile=/run/munge/munged.pid
+RuntimeDirectory=munge
+RuntimeDirectoryMode=0755
+User=munge
+Group=munge
+Restart=on-abort
+
+[Install]
+WantedBy=multi-user.target
+EOF
+: > /etc/default/munge 2>/dev/null || true
+systemctl daemon-reload
+
 if [[ -s "${STAGE}/munge.key" ]]; then
   echo "    taking munge key from shared storage (${STAGE})"
   install -o munge -g munge -m 400 "${STAGE}/munge.key" /etc/munge/munge.key
@@ -103,7 +128,7 @@ chown munge:munge /etc/munge/munge.key
 chmod 400 /etc/munge/munge.key
 systemctl reset-failed munge 2>/dev/null || true
 systemctl enable munge >/dev/null 2>&1 || true
-systemctl restart munge
+systemctl restart munge 2>/dev/null || true
 sleep 2
 if ! munge -n | unmunge 2>/dev/null | grep -q "STATUS:.*Success"; then
   echo "!! munge failed. Diagnostics:"
