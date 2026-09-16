@@ -7,6 +7,11 @@
 # =====================================================================
 set -euo pipefail
 
+# shared helpers (needrestart, defensive users, shared storage)
+source "$(dirname "$0")/lib.sh"
+disable_needrestart
+
+
 # ---------------------------------------------------------------
 # Node roles - adjust if your hostnames differ
 # ---------------------------------------------------------------

@@ -10,6 +10,11 @@
 # =====================================================================
 set -euo pipefail
 
+# shared helpers (needrestart, defensive users, shared storage)
+source "$(dirname "$0")/lib.sh"
+disable_needrestart
+
+
 SLURM_VERSION="${SLURM_VERSION:-23.11}"   # match installed slurm-wlm
 PYXIS_VERSION="${PYXIS_VERSION:-0.24.0}"  # check https://github.com/NVIDIA/pyxis/tags
 ENROOT_VERSION="${ENROOT_VERSION:-4.2.1}" # check https://github.com/NVIDIA/enroot/tags

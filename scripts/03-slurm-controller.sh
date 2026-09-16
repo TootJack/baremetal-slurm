@@ -11,6 +11,11 @@
 # =====================================================================
 set -euo pipefail
 
+# shared helpers (needrestart, defensive users, shared storage)
+source "$(dirname "$0")/lib.sh"
+disable_needrestart
+
+
 # ---------------------------------------------------------------
 # 0a. Must run as root. `NODE2_HOST=x sudo -E bash 03...` is fine;
 #     plain `sudo bash 03...` is fine. But if someone runs it WITHOUT
@@ -58,23 +63,63 @@ echo "    controller: ${NODE1} $(hostname -I 2>/dev/null | awk '{print $1}')"
 
 # ---------------------------------------------------------------
 # 1. Packages
+#
+# IMPORTANT: these nodes ship a VENDOR Slurm stack (seen on hgx01:
+#   slurm23.02-client 23.02.8-100881-cm10.0-48e305b89c
+# which is a Bright/BaseCommand-style build). A naive
+# `apt-get install slurm-wlm` REMOVES that client and installs Ubuntu's
+# 21.08.5 instead - a downgrade that also loses features the SOW needs
+# (JobRequeue/PreemptMode semantics, newer gres.conf options).
+# Detect it and stop, rather than silently replacing someone's stack.
 # ---------------------------------------------------------------
 export DEBIAN_FRONTEND=noninteractive
+VENDOR_SLURM="$(dpkg -l 2>/dev/null | awk '/^ii/ && $2 ~ /^slurm[0-9]/ {print $2" "$3}' | head -5)"
+if [[ -n "$VENDOR_SLURM" ]]; then
+  echo "    !! A vendor Slurm stack is already installed:"
+  sed 's/^/       /' <<<"$VENDOR_SLURM"
+  echo
+  echo "    Installing Ubuntu's slurm-wlm would REPLACE it (and downgrade"
+  echo "    to 21.08). Choose one and re-run with the matching mode:"
+  echo
+  echo "      SLURM_MODE=vendor   keep/configure the existing vendor stack"
+  echo "                          (packages untouched; only slurm.conf + dbd)"
+  echo "      SLURM_MODE=distro   install Ubuntu slurm-wlm (replaces vendor)"
+  echo "      SLURM_MODE=source   build Slurm 25.11 from source (PMC/SOW"
+  echo "                          target, needs build deps + ~10 min)"
+  echo
+  echo "    Refusing to guess. Set SLURM_MODE and re-run."
+  exit 1
+fi
+
 apt-get update -qq
 apt-get install -y -qq slurm-wlm slurmdbd munge mariadb-server \
-  libmunge-dev libmariadb-dev
+  libmunge-dev libmariadb-dev 2>&1 | tail -3
 
 # ---------------------------------------------------------------
 # 2. Munge
+#    The munge package normally creates the user, but on hgx01 a vendor
+#    stack was being replaced and the user was absent, so `chown munge:`
+#    failed with "invalid spec" and killed the script under `set -e`.
+#    Create the user/group defensively, and name the group explicitly.
 # ---------------------------------------------------------------
+getent group munge >/dev/null 2>&1 || groupadd -r munge
+if ! getent passwd munge >/dev/null 2>&1; then
+  useradd -r -g munge -d /var/lib/munge -s /usr/sbin/nologin munge 2>/dev/null \
+    || useradd -r -g munge -d /var/lib/munge -s /bin/false munge
+fi
+mkdir -p /etc/munge /var/lib/munge /var/log/munge /run/munge
+chown -R munge:munge /etc/munge /var/lib/munge /var/log/munge 2>/dev/null || true
+chmod 0700 /etc/munge /var/lib/munge
 if [[ ! -s /etc/munge/munge.key ]]; then
   dd if=/dev/urandom bs=1 count=1024 of=/etc/munge/munge.key 2>/dev/null
 fi
-chown munge: /etc/munge/munge.key
+chown munge:munge /etc/munge/munge.key
 chmod 400 /etc/munge/munge.key
-systemctl enable --now munge
+systemctl enable --now munge 2>/dev/null || systemctl restart munge
 sleep 1
-munge -n | unmunge | grep -q "STATUS:.*Success" && echo "    munge OK"
+munge -n | unmunge 2>/dev/null | grep -q "STATUS:.*Success" \
+  && echo "    munge OK" \
+  || { echo "    !! munge failed"; journalctl -u munge -n 10 --no-pager; exit 1; }
 
 # ---------------------------------------------------------------
 # 3. MariaDB accounting DB
