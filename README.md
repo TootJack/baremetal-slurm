@@ -215,8 +215,11 @@ four further defects it hid — all reproduced in a real cluster, all fixed:
 | 11 | documented order was a deadlock | 03 wrote a conf without node 2; 04 installed it verbatim → `fatal: Unable to determine this slurmd's NodeName`; only *then* did the docs say to add node 2 | 04 publishes its node line and stops; then 03 adds node 2; then 04 starts slurmd. Order documented as asymmetric + idempotent |
 | 12 | `sinfo ... \|\| sinfo` as the last command under `set -e` | both fail while slurmctld restarts → **03 exits 1 despite succeeding** | report-only, never fatal; `sinfo` retried with a hint |
 | 13 | `resolve_shared_root` sourced the conf file over `SHARED_ROOT` | an explicit `SHARED_ROOT=` override was silently ignored (and untestable) | environment wins over the file |
+| 14 | node physically healthy but stuck `DRAIN` after a failed registration | jobs never run; `ReturnToService` does **not** clear it | `node_mgr.c` only returns a node to service when `IS_NODE_DOWN() && !IS_NODE_INVALID_REG() && ret2service==2` — INVALID_REG is explicitly excluded, so `03` resumes nodes that now register cleanly and leaves genuinely failing ones drained |
+| 15 | state dir holding `clustername` without `assoc_usage` | `fatal: No Assoc usage file ... to recover` — slurmctld crash-loops forever, and a matching cluster name makes it look fine | detect the inconsistent dir and reset it (previous conditions only fired on `RESET_ACCT_DB=1` or a name mismatch) |
+| 16 | pasting a ` ```bash ` fence into the shell | bash treats the backticks as an unterminated command substitution and swallows everything pasted after it (`unexpected EOF while looking for matching ``'`), so the session hangs and later commands silently never run | `poc.sh`: one paste-safe word per action; README no longer instructs pasting commands |
 
-Bugs 6-13 are the multi-node blockers: with the full stack installed, `hgx01`
+Bugs 6-16 are the multi-node blockers: with the full stack installed, `hgx01`
 showed the node as `inval` and `hgx20` could not reach the controller at all.
 All are fixed and locked down by `test/verify-hosts-resolution.sh` (11
 assertions), `test/verify-multinode-bootstrap.sh` (11),
