@@ -26,58 +26,20 @@ echo "    Compute:    ${SLURM_COMPUTE}"
 # 1. Hostname resolution across the two nodes
 #    Real values for this cluster: hgx01=10.100.18.5, hgx20=10.100.18.8
 #    Both nodes are 10.100.18.0/24 on bond0, so they CAN reach each other.
+#
+#    The logic lives in lib.sh (install_cluster_hosts / verify_cluster_hosts)
+#    so the regression test exercises the SAME code rather than a copy.
 # ---------------------------------------------------------------
-# Slurm resolves SlurmctldHost=<name> through /etc/hosts (there is no DNS for
-# these names). The controller and every compute node MUST map the name to the
-# SAME address, or RPCs fail - the exact failure mode we hit in testing:
-#   sinfo: error: Unable to contact slurm controller (connect failure)
-#   slurm_load_partitions: Socket timed out on send/recv operation
-HOSTS_BLOCK="${HOSTS_BLOCK:-10.100.18.5  hgx01
-10.100.18.8  hgx20}"
-
-# Debian/Ubuntu ship a `127.0.1.1 <hostname>` line. That makes the node's OWN
-# name resolve to LOOPBACK, so on the controller `SlurmctldHost=hgx01` binds
-# 127.0.1.1 and no other node can reach it:
-#   sinfo: error: Unable to contact slurm controller (connect failure)
-#   slurm_load_partitions: Socket timed out on send/recv operation
-# gethostbyname returns the FIRST match, so appending the LAN mapping is not
-# enough - the loopback line must go. Remove any line that maps a cluster node
-# name to a loopback address before installing the real mapping.
-for _node in $(echo "$HOSTS_BLOCK" | awk '{print $2}'); do
-  if grep -qE "^[[:space:]]*127\.[0-9.]+[[:space:]]+.*\b${_node}\b" /etc/hosts 2>/dev/null; then
-    echo "    removing loopback entry for ${_node} (it would shadow the LAN IP)"
-    sed -i -E "/^[[:space:]]*127\.[0-9.]+[[:space:]]+.*\b${_node}\b/d" /etc/hosts
-  fi
-done
-
-# Rebuild the block whenever it is missing OR does not match the expected
-# mapping. A plain "is the marker present?" guard would silently keep a stale
-# or partial block from an earlier run forever.
-if [[ "$(sed -n '/# BEGIN i3d-slurm-cluster/,/# END i3d-slurm-cluster/p' /etc/hosts 2>/dev/null \
-        | grep -v '^#')" != "$HOSTS_BLOCK" ]]; then
-  echo "==> Updating cluster hosts in /etc/hosts"
-  sed -i '/# BEGIN i3d-slurm-cluster/,/# END i3d-slurm-cluster/d' /etc/hosts
-  { echo "# BEGIN i3d-slurm-cluster"
-    echo "$HOSTS_BLOCK"
-    echo "# END i3d-slurm-cluster"
-  } >> /etc/hosts
-  echo "    set: $(echo "$HOSTS_BLOCK" | tr '\n' ' ')"
+BLOCK="$(cluster_hosts_block)"
+if [[ "$(install_cluster_hosts "$BLOCK")" == "UPDATED" ]]; then
+  echo "==> Updated cluster hosts in /etc/hosts"
+  echo "    set: $(echo "$BLOCK" | tr '\n' ' ')"
 else
   echo "    /etc/hosts cluster block already correct"
 fi
 
 # Verify the mapping matches on THIS node - do not just probe for existence.
-hosts_ok=1
-while read -r ip name; do
-  [[ -z "$ip" || -z "$name" ]] && continue
-  # `getent ahostsv4` returns the IPv4 for the name; take the first field.
-  resolved="$(getent ahostsv4 "$name" 2>/dev/null | awk '{print $1}' | head -1)"
-  if [[ "$resolved" != "$ip" ]]; then
-    echo "    !! ${name} resolves to '${resolved}', expected '${ip}'"
-    hosts_ok=0
-  fi
-done <<<"$HOSTS_BLOCK"
-if [[ "$hosts_ok" == "1" ]]; then
+if verify_cluster_hosts "$BLOCK"; then
   echo "    hostname resolution OK ($(hostname -s) sees both nodes)"
 else
   echo "    !! hostname resolution FAILED - Slurm will not reach the controller"
