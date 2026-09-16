@@ -1,0 +1,9 @@
+# secrets / local state
+pubkeys/*.pub
+*.key
+/root/
+*.sqsh
+
+# OS
+.DS_Store
+Thumbs.db
