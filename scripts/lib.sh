@@ -103,16 +103,64 @@ cluster_hosts_current() {
 }
 
 # Install/repair the cluster block in /etc/hosts. Echoes "UPDATED" or "UNCHANGED".
-# Does NOT touch anything outside its own marked block except the loopback
-# shadow lines, which must go for the names it manages.
+#
+# The names in the block become AUTHORITATIVE. nsswitch is normally
+# `hosts: files dns`, and within `files` the FIRST matching line wins. So a
+# stale, duplicate, or unmarked mapping anywhere else in the file silently
+# beats the block we write - and a wrong one (an old IP, or the 127.0.1.1
+# shadow) still resolves "successfully", just to the wrong address. Every
+# non-block line that maps a managed name is therefore removed.
 install_cluster_hosts() {
   local block="${1:-$(cluster_hosts_block)}" n changed="UNCHANGED"
-  for n in $(awk '{print $2}' <<<"$block"); do
-    if grep -qE "^[[:space:]]*127\.[0-9.]+[[:space:]]+.*\b${n}\b" /etc/hosts 2>/dev/null; then
-      echo "    removing loopback entry for ${n} (it would shadow the LAN IP)" >&2
-      sed -i -E "/^[[:space:]]*127\.[0-9.]+[[:space:]]+.*\b${n}\b/d" /etc/hosts
-    fi
-  done
+  local names tmp
+  names="$(awk '{print $2}' <<<"$block" | tr '\n' ' ')"
+  tmp="$(mktemp)"
+
+  # Any line OUTSIDE our marked block that claims one of these names loses that
+  # name. Only the managed NAME is dropped - unrelated aliases on the same line
+  # are preserved. A line left with nothing but its address is removed.
+  awk -v names="$names" '
+    /# BEGIN i3d-slurm-cluster/ { inblk = 1 }
+    inblk { print; if (/# END i3d-slurm-cluster/) inblk = 0; next }
+    /^[[:space:]]*#/ { print; next }
+    NF == 0 { print; next }
+    {
+      n = split(names, want, " ")
+      m = NF
+      out = $1
+      kept = 0
+      linehit = 0
+      for (i = 2; i <= m; i++) {
+        managed = 0
+        for (j = 1; j <= n; j++) if ($i == want[j]) managed = 1
+        if (managed) { linehit = 1; removed++; continue }
+        out = out " " $i
+        kept++
+      }
+      if (kept == 0 && linehit) next   # address now has no names left
+      print out
+    }
+    END { if (removed) exit 7 }
+  ' /etc/hosts > "$tmp"
+  local rc=$?
+  if [[ "$rc" == "7" ]]; then
+    # Report only names that appear OUTSIDE the managed block - those are the
+    # ones that were shadowing it. Grepping the whole file would also match the
+    # block's own (correct) entries and report them as removed.
+    local outside
+    outside="$(sed '/# BEGIN i3d-slurm-cluster/,/# END i3d-slurm-cluster/d' /etc/hosts)"
+    for n in $names; do
+      if grep -qE "(^|[[:space:]])${n}([[:space:]]|$)" <<<"$outside" 2>/dev/null; then
+        echo "    removing stray/duplicate mapping(s) for ${n}" \
+             "(they shadow the managed block)" >&2
+      fi
+    done
+    # preserve inode/permissions; /etc/hosts may be bind-mounted
+    cat "$tmp" > /etc/hosts
+    changed="UPDATED"
+  fi
+  rm -f "$tmp"
+
   if [[ "$(cluster_hosts_current)" != "$block" ]]; then
     sed -i '/# BEGIN i3d-slurm-cluster/,/# END i3d-slurm-cluster/d' /etc/hosts
     { echo "# BEGIN i3d-slurm-cluster"
@@ -137,4 +185,27 @@ verify_cluster_hosts() {
     fi
   done <<<"$block"
   return $rc
+}
+
+# Diagnostic: show EVERY /etc/hosts line that mentions the managed names, plus
+# what each name actually resolves to. Use when verify_cluster_hosts fails -
+# resolution is `files` first (first match wins), so a stray or duplicated
+# line elsewhere in the file silently overrides the managed block.
+show_cluster_hosts_sources() {
+  local block="${1:-$(cluster_hosts_block)}" ip name resolved
+  echo "  --- /etc/hosts lines mentioning managed names ---"
+  while read -r ip name; do
+    [[ -z "$ip" || -z "$name" ]] && continue
+    local hits
+    hits="$(grep -nE "(^|[[:space:]])${name}([[:space:]]|$)" /etc/hosts 2>/dev/null)"
+    if [[ -n "$hits" ]]; then
+      echo "$hits" | sed "s/^/    /"
+    else
+      echo "    (no /etc/hosts entry for ${name})"
+    fi
+    resolved="$(getent ahostsv4 "$name" 2>/dev/null | awk '{print $1}' | head -1)"
+    echo "    => ${name} resolves to ${resolved:-<nothing>}"
+  done <<<"$block"
+  echo "  --- nsswitch hosts order ---"
+  grep '^hosts:' /etc/nsswitch.conf 2>/dev/null | sed 's/^/    /'
 }
