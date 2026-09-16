@@ -32,35 +32,51 @@ pubkeys/                   <user>.pub files go here before running 02
 
 ## Install order
 
+Scripts auto-detect hostname, CPU, RAM and GPU type — no editing needed.
+Node 2 is optional at first; add it with `NODE2_HOST` when it comes up.
+
 ```bash
-# on node1
-sudo bash 01-base.sh
-sudo bash 02-users.sh          # needs pubkeys/<user>.pub present
-sudo bash 03-slurm-controller.sh
+# on node 1 (single node is fine to start)
+sudo bash scripts/01-base.sh
+sudo bash scripts/02-users.sh          # needs pubkeys/<user>.pub present
+sudo bash scripts/03-slurm-controller.sh          # node1 only
+GPU_TYPE=h200 sudo -E bash scripts/03-slurm-controller.sh   # force GRES type
+NODE2_HOST=<node2> sudo -E bash scripts/03-slurm-controller.sh   # include node2
 
-# copy the munge key to node2
-sudo scp /etc/munge/munge.key node2:/etc/munge/
-sudo ssh node2 chown munge: /etc/munge/munge.key
+# on node 2, once it is up
+sudo scp node1:/etc/munge/munge.key /etc/munge/
+sudo bash scripts/01-base.sh
+CTRL_HOST=<node1> sudo -E bash scripts/04-slurm-compute.sh
 
-# on node2
-sudo bash 01-base.sh
-sudo bash 04-slurm-compute.sh
+# on BOTH nodes (containers / sqsh)
+sudo bash scripts/05-pyxis-enroot.sh
 
-# on BOTH nodes
-sudo bash 05-pyxis-enroot.sh
-
-# verify (node1)
-sinfo -N -o "%N %T %G"         # both nodes idle, gpu:h200:8
+# verify
+sinfo -N -o "%N %T %C %G"      # nodes idle, Gres=gpu:<type>:8
 srun --container-image=/shared/containers/ubuntu-test.sqsh echo OK
+```
+
+Or use the single entry point that tees a log for pasting back:
+
+```bash
+bash scripts/run-on-node.sh preflight     # hardware/driver/GRES report
+bash scripts/run-on-node.sh controller    # 01 + 03
+bash scripts/run-on-node.sh containers    # 05
+bash scripts/run-on-node.sh verify        # sbatch + container smoke test
 ```
 
 ## Before you run anything
 
-1. **Edit `/etc/hosts`** on both nodes (01-base.sh prints a template) with the real IPs.
-2. **Collect ed25519 public keys** from the 3 users into `pubkeys/`:
-   each user runs `ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519` on their laptop
-   and sends you `~/.ssh/id_ed25519.pub`.
-3. **Adjust node specs** in 03 (CPUs/RAM) after running `slurmd -C` on each node.
+1. **Collect ed25519 public keys** from the 3 users into `pubkeys/`:
+   each user runs `ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519` on their
+   laptop and sends you `~/.ssh/id_ed25519.pub`.
+2. **Verify the GRES type matches the driver.** `03` derives it from
+   `nvidia-smi --query-gpu=name` (lowercased, spaces→underscores). If Slurm's
+   detected name differs, set `GPU_TYPE=<substring>`. A mismatch makes Slurm
+   register fewer GPUs than configured and **DRAIN the node**.
+   `bash scripts/run-on-node.sh preflight` prints both values to compare.
+3. ~~Edit `/etc/hosts`~~ — replaced by auto-detection of the real hostname.
+
 4. **VPN**: connect FortiClient (profile "baremetal") to reach the nodes.
 
 ## What was verified (before shipping)
@@ -118,20 +134,30 @@ sbatch examples/train-cpt.sbatch
 - **Access**: `ssh ubuntu@10.100.18.5` — requires **FortiClient** VPN
   (profile `baremetal` → gateway `78.100.71.218:10443`). **No Tailscale**
   (30-day POC, kept simple).
-- **eduVPN + FortiClient can coexist**: the FortiClient gateway is reachable
-  while eduVPN is up. Exited Tailscale because its `10.0.0.0/8` subnet route
-  was shadowing the path to `10.100.18.5`.
-- **Passwordless sudo** is granted to the `ubuntu` user by
-  `test/bootstrap-key.py`, and to ML users by `scripts/02-users.sh`.
+- **eduVPN and FortiClient are MUTUALLY EXCLUSIVE** (empirically confirmed
+  in both directions):
+  - *eduVPN connected* → the agent works, but FortiClient's tunnel does not
+    establish (`10.100.18.5:22` unreachable, `ping` = "General failure").
+  - *FortiClient connected* → the node is reachable (ping 132 ms, port 22 OK),
+    but the model endpoint times out, so the agent stops working.
+  - **Consequence: the agent cannot drive the SSH session.** The operator runs
+    the scripts and pastes the logs back.
+- Tailscale was removed (its `10.0.0.0/8` subnet route also shadowed the
+  path to `10.100.18.5`; unnecessary for a 30-day POC).
 
-### First step on the live node
+### How to run this (no agent access to the node)
 
 ```bash
-# 1. Connect FortiClient (GUI) - profile "baremetal", username starts with mB
-# 2. Verify:
-#    ping 10.100.18.5
-# 3. Install the ed25519 key + enable key-only auth + sudoers:
-python test/bootstrap-key.py
-# 4. Then everything else runs over the key:
-ssh ubuntu@10.100.18.5 'sudo bash -s' < scripts/01-base.sh
+# 1. Connect FortiClient (GUI): profile "baremetal", gateway 78.100.71.218:10443
+# 2. Confirm the node answers:
+ping 10.100.18.5
+# 3. Copy this repo to the node, then run ONE command:
+scp -r . ubuntu@10.100.18.5:/tmp/i3d-slurm-poc
+ssh ubuntu@10.100.18.5
+cd /tmp/i3d-slurm-poc && bash scripts/run-on-node.sh preflight
+# 4. Paste the preflight output back to the agent, then:
+bash scripts/run-on-node.sh controller
 ```
+`run-on-node.sh` tees everything to `/tmp/poc-<stage>-<ts>.log` so you can
+paste `tail -n 200` straight back.
+
