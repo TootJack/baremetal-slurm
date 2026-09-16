@@ -141,6 +141,34 @@ chmod 644 /etc/profile.d/slurm.sh
 echo "${PREFIX}/lib" > /etc/ld.so.conf.d/slurm.conf
 ldconfig
 
+# CRITICAL: make our binaries win for EVERY shell, not just login shells.
+# /etc/profile.d is only sourced by login shells, so a bare `sinfo` or
+# `slurmd -C` could resolve to the distro 21.08 build. Symptoms observed on
+# hgx20:
+#   - `slurmd -C` printed NO Gres   (21.08 has no NVML support)
+#   - `sinfo` failed "Unable to contact slurm controller" because a 21.08
+#     client cannot speak to a 25.11 daemon (protocol version mismatch)
+# Symlinks in /usr/local/bin (which precedes /usr/bin in the default PATH)
+# fix this permanently, including under `sudo`.
+mkdir -p /usr/local/bin
+for b in "${PREFIX}"/bin/* "${PREFIX}"/sbin/*; do
+  [[ -x "$b" ]] || continue
+  ln -sf "$b" "/usr/local/bin/$(basename "$b")"
+done
+echo "    symlinked Slurm binaries into /usr/local/bin ($(ls /usr/local/bin | wc -l) entries)"
+
+# Remove the DISTRO slurm client/daemon packages outright. Leaving them
+# installed shadows /opt/slurm and creates version-mismatch failures.
+DISTRO_SLURM="$(dpkg -l 2>/dev/null \
+  | awk '/^ii/ && $2 ~ /^slurm(wlm|-client|-ctld|d|-dbd)?$/ {print $2}' | head -10)"
+if [[ -n "$DISTRO_SLURM" ]]; then
+  echo "    removing distro Slurm packages that would shadow ${PREFIX}:"
+  echo "$DISTRO_SLURM" | sed 's/^/      /'
+  for p in $DISTRO_SLURM; do
+    apt-get remove -y -qq "$p" 2>&1 | tail -1 || true
+  done
+fi
+
 # Pyxis (and any SPANK plugin) compiles against spank.h. A source install
 # puts headers under ${PREFIX}/include, which is NOT on the default
 # compiler path - so symlink them, otherwise pyxis fails to build.

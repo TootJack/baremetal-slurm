@@ -543,13 +543,30 @@ chown -R root:root /var/spool/slurmctld /var/spool/slurmd
 # ClusterName ("fatal: CLUSTER NAME MISMATCH"). That happens when this script
 # is re-run against an old state dir. Detect and clear it.
 if [[ -f /var/spool/slurmctld/clustername ]]; then
-  # Slurm writes "<ClusterName>|<version>", e.g. "i3dpoc|1632" - comparing
+  # Slurm writes "<ClusterName>|<ClusterID>", e.g. "i3dpoc|3744" - comparing
   # the raw contents against ClusterName always mismatched and archived the
-  # state dir on every run. Strip the version suffix.
-  OLD_NAME="$(cat /var/spool/slurmctld/clustername 2>/dev/null \
-              | tr -d '[:space:]' | cut -d'|' -f1)"
-  if [[ -n "$OLD_NAME" && "$OLD_NAME" != "$CLUSTER_NAME" ]]; then
-    echo "    !! state dir holds cluster '${OLD_NAME}', we want '${CLUSTER_NAME}'"
+  # state dir on every run. Strip the ID suffix.
+  #
+  # CRITICAL: the ID must ALSO match the accounting DB. Recreating the DB
+  # (RESET_ACCT_DB=1) mints a NEW ClusterID, and a stale state file then
+  # makes slurmctld die with:
+  #   fatal: CLUSTER ID MISMATCH.
+  #   slurmctld has been started with "ClusterID=3744" from the state files,
+  #   but the DBD thinks it should be "1540".
+  # which leaves the node stuck in `inval`. So when the DB is being reset,
+  # drop the state dir too.
+  OLD_CLUSTER="$(tr -d '[:space:]' < /var/spool/slurmctld/clustername 2>/dev/null)"
+  OLD_NAME="${OLD_CLUSTER%%|*}"
+  OLD_ID="${OLD_CLUSTER##*|}"
+  if [[ "${RESET_ACCT_DB:-0}" == "1" ]]; then
+    echo "    RESET_ACCT_DB=1 -> also clearing the slurmctld state dir"
+    echo "      (a fresh DB mints a new ClusterID; a stale state file causes"
+    echo "       'fatal: CLUSTER ID MISMATCH' and leaves the node inval)"
+    mv /var/spool/slurmctld "/var/spool/slurmctld.bak.$(date +%s)" 2>/dev/null || true
+    mkdir -p /var/spool/slurmctld
+    chown root:root /var/spool/slurmctld
+  elif [[ -n "$OLD_NAME" && "$OLD_NAME" != "$CLUSTER_NAME" ]]; then
+    echo "    !! state dir holds cluster '${OLD_NAME}' (id ${OLD_ID}), want '${CLUSTER_NAME}'"
     echo "       archiving old state so slurmctld can start"
     mv /var/spool/slurmctld "/var/spool/slurmctld.bak.$(date +%s)"
     mkdir -p /var/spool/slurmctld

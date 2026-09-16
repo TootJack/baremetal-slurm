@@ -337,3 +337,72 @@ munge active | mariadb active | slurmdbd active | slurmctld active | slurmd acti
 [node] idle
 EXIT=0
 ```
+
+## GPU GRES CONFIRMED on the H200 nodes ✅
+
+```
+hgx01: slurmd -C → NodeName=hgx01 ... Gres=gpu:nvidia_h200:8
+                   Found gpu:nvidia_h200:8 with Autodetect=nvml
+hgx20: slurmd -C → ... Gres=gpu:nvidia_h200:8
+```
+
+`HAVE_NVML 1` at build time **and** working NVML at runtime on both nodes.
+Jobs requesting `--gres=gpu` will schedule.
+
+## Remaining fixes from the hgx01/hgx20 run
+
+### 1. `inval` state: `fatal: CLUSTER ID MISMATCH`
+
+The node sat in `inval` because:
+
+```
+slurmctld has been started with "ClusterID=3744" from the state files,
+but the DBD thinks it should be "1540".
+```
+
+`RESET_ACCT_DB=1` mints a **new ClusterID**, but the old `/var/spool/slurmctld`
+survives. My guard only compared `ClusterName`, missing the ID. Now:
+
+- the file is parsed as `<ClusterName>|<ClusterID>` (not compared raw)
+- `RESET_ACCT_DB=1` **also clears the state dir**, so the ID matches
+
+*Verified:* stale state + fresh DB → `slurmd`/`slurmctld` start, node `idle`.
+
+### 2. Bare `sinfo`/`slurmd` resolved to the wrong Slurm
+
+On hgx20, bare `slurmd -C` printed **no Gres** and `sinfo` failed with
+"Unable to contact slurm controller" — while `export PATH=/opt/slurm/sbin`
+made both work. Cause: `/etc/profile.d` only loads for **login** shells, so
+interactive `sudo` sessions fell back to the distro 21.08 client, which
+cannot talk to a 25.11 daemon (protocol mismatch).
+
+Fix in `slurm-source.sh`:
+- symlink every `/opt/slurm/{bin,sbin}/*` into `/usr/local/bin`
+  (precedes `/usr/bin` in the default PATH, and works under `sudo`)
+- remove the distro `slurm*` packages that shadow it
+
+### 3. `enroot import` failed as `nobody`
+
+```
+mkdir: cannot create directory '/tmp/enroot-data/65534': Permission denied
+FATAL ERROR: Could not read $HOME, use -recovery-path
+```
+
+`nobody` (uid 65534) has no home. `05` now imports as a real user
+(`mluser1`/`ubuntu`/`slurmadmin`) and pre-creates the enroot dirs
+world-writable. Import as root is the fallback, and the resulting `.sqsh`
+is verified readable with `unsquashfs -l`.
+
+## Next
+
+```bash
+git pull    # both nodes
+# hgx01: reset DB + state together, now a single flag
+RESET_ACCT_DB=1 sudo -E SLURM_MODE=source bash scripts/03-slurm-controller.sh
+NODE2_HOST=hgx20 RESET_ACCT_DB=1 sudo -E SLURM_MODE=source bash scripts/03-slurm-controller.sh
+# hgx20
+sudo -E SLURM_MODE=source bash scripts/04-slurm-compute.sh
+# both
+sudo bash scripts/05-pyxis-enroot.sh
+sinfo -N -o "%N %T %C %G"     # expect: hgx01 idle, hgx20 idle, gpu:nvidia_h200:8
+```

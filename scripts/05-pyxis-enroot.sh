@@ -141,12 +141,49 @@ systemctl is-active --quiet slurmd && echo "    slurmd restarted with pyxis" \
 # ---------------------------------------------------------------
 # 4. Sanity: build and cache a small test sqsh (both nodes)
 # ---------------------------------------------------------------
+# ---------------------------------------------------------------
+# Build a small test image (both nodes) so a smoke test is possible
+# immediately. Imported as a REAL login user with a home directory, not
+# `nobody`: enroot needs $HOME for its cache/runtime, and `nobody` (uid
+# 65534) has neither, which produced:
+#   mkdir: cannot create directory '/tmp/enroot-data/65534': Permission denied
+#   FATAL ERROR: Could not read $HOME, use -recovery-path
+# Also pre-create the dirs with the right ownership/mode.
+# ---------------------------------------------------------------
 mkdir -p "${SHARED_IMGS}"
+for d in /tmp/enroot-data /tmp/enroot-cache /run/enroot; do
+  mkdir -p "$d"
+  chmod 1777 "$d" 2>/dev/null || true
+done
+# enroot is normally invoked as the cluster's own users; pick a real one.
+ENROOT_IMPORT_USER="${ENROOT_IMPORT_USER:-}"
+if [[ -z "$ENROOT_IMPORT_USER" ]]; then
+  for cand in mluser1 ubuntu slurmadmin; do
+    id "$cand" >/dev/null 2>&1 && { ENROOT_IMPORT_USER="$cand"; break; }
+  done
+fi
+
 if [[ ! -f "${SHARED_IMGS}/ubuntu-test.sqsh" ]]; then
   echo "    importing test image -> ${SHARED_IMGS}/ubuntu-test.sqsh"
-  runuser -u "$(id -un 1000 2>/dev/null || echo nobody)" -- \
-    enroot import -o "${SHARED_IMGS}/ubuntu-test.sqsh" docker://ubuntu:24.04 \
-    || enroot import -o "${SHARED_IMGS}/ubuntu-test.sqsh" docker://ubuntu:24.04
+  # -o writes the sqsh into shared storage; TMPDIR must be writable too.
+  if [[ -n "$ENROOT_IMPORT_USER" ]]; then
+    echo "    as user: ${ENROOT_IMPORT_USER}"
+    runuser -u "$ENROOT_IMPORT_USER" -- env TMPDIR=/tmp \
+      enroot import -o "${SHARED_IMGS}/ubuntu-test.sqsh" docker://ubuntu:24.04 \
+      || enroot import -o "${SHARED_IMGS}/ubuntu-test.sqsh" docker://ubuntu:24.04
+  else
+    echo "    (no unprivileged user found; importing as root)"
+    TMPDIR=/tmp enroot import -o "${SHARED_IMGS}/ubuntu-test.sqsh" docker://ubuntu:24.04
+  fi
+  # verify we actually produced a usable image
+  if [[ -s "${SHARED_IMGS}/ubuntu-test.sqsh" ]] \
+     && command -v unsquashfs >/dev/null 2>&1; then
+    unsquashfs -l "${SHARED_IMGS}/ubuntu-test.sqsh" >/dev/null 2>&1 \
+      && echo "    sqsh verified readable" \
+      || echo "    !! sqsh produced but not readable"
+  fi
+else
+  echo "    test image already present"
 fi
 
 echo "==> 05-pyxis-enroot.sh DONE"
