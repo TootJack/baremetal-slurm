@@ -74,6 +74,22 @@ mkdir -p /etc/munge /var/lib/munge /var/log/munge /run/munge
 chown -R munge:munge /etc/munge /var/lib/munge /var/log/munge 2>/dev/null || true
 chmod 0700 /etc/munge /var/lib/munge
 
+# A vendor stack leaves /etc/default/munge pointing at ITS OWN key, e.g.
+#   OPTIONS="--key-file=/cm/shared/apps/slurm/var/munge/keys/munge.key"
+# The munge unit runs `munged $OPTIONS`, so that would override our key and
+# break authentication (or fail outright if the vendor tree is gone).
+cat > /etc/default/munge <<'EOF'
+# MUNGE configuration - managed by the i3D Slurm POC scripts.
+# Pinned to the standard key path; a vendor --key-file here would override
+# /etc/munge/munge.key because the unit runs `munged $OPTIONS`.
+OPTIONS="--key-file=/etc/munge/munge.key"
+EOF
+if [[ -d /etc/systemd/system/munge.service.d ]]; then
+  rm -f /etc/systemd/system/munge.service.d/*.conf 2>/dev/null || true
+  rmdir /etc/systemd/system/munge.service.d 2>/dev/null || true
+  systemctl daemon-reload
+fi
+
 if [[ -s "${STAGE}/munge.key" ]]; then
   echo "    taking munge key from shared storage (${STAGE})"
   install -o munge -g munge -m 400 "${STAGE}/munge.key" /etc/munge/munge.key
@@ -85,10 +101,16 @@ elif [[ ! -s /etc/munge/munge.key ]]; then
 fi
 chown munge:munge /etc/munge/munge.key
 chmod 400 /etc/munge/munge.key
-systemctl enable --now munge 2>/dev/null || systemctl restart munge
-sleep 1
-munge -n | unmunge 2>/dev/null | grep -q "STATUS:.*Success" \
-  || { echo "!! munge failed"; journalctl -u munge -n 10 --no-pager; exit 1; }
+systemctl reset-failed munge 2>/dev/null || true
+systemctl enable munge >/dev/null 2>&1 || true
+systemctl restart munge
+sleep 2
+if ! munge -n | unmunge 2>/dev/null | grep -q "STATUS:.*Success"; then
+  echo "!! munge failed. Diagnostics:"
+  systemctl status munge --no-pager 2>/dev/null | head -10
+  journalctl -u munge -n 10 --no-pager 2>/dev/null | tail -8
+  exit 1
+fi
 echo "    munge OK  (md5: $(md5sum < /etc/munge/munge.key | cut -c1-16))"
 
 # ---------------------------------------------------------------

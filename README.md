@@ -246,3 +246,51 @@ daemons: munge, mariadb, slurmdbd, slurmctld, slurmd all active
 
 Note Pyxis builds against the version of Slurm that will load it — a mismatch
 makes `slurmd` **refuse to start entirely**, not merely skip the plugin.
+
+## Vendor-stack landmines (found on hgx01)
+
+Removing the vendor Slurm leaves configuration pointing at the **deleted**
+tree. These bit us in sequence and are now handled automatically.
+
+### 1. `munge` fails: vendor `OPTIONS` overrides the key path
+
+hgx01 error:
+```
+Job for munge.service failed because the control process exited with error code.
+Process: ExecStart=/usr/sbin/munged --key-file=/cm/shared/apps/slurm/var/munge/keys/munge.key
+```
+
+The Ubuntu munge unit is:
+```
+EnvironmentFile=-/etc/default/munge
+ExecStart=/usr/sbin/munged $OPTIONS
+```
+
+The vendor stack wrote `OPTIONS="--key-file=/cm/shared/apps/slurm/var/munge/keys/munge.key"`
+into `/etc/default/munge`. That path belongs to the vendor tree we removed,
+so `munged` exits 1 and **the whole cluster stops authenticating**.
+
+Fix: `03`/`04` rewrite `/etc/default/munge` to
+`OPTIONS="--key-file=/etc/munge/munge.key"` and clear any
+`munge.service.d/*.conf` drop-ins.
+
+*Reproduced and verified:* vendor `OPTIONS` → `failed`; after fix →
+`active` + `STATUS: Success`.
+
+### 2. Stale systemd drop-ins for slurmctld/slurmdbd
+
+`/etc/systemd/system/slurm{ctld,dbd}.service.d/override.conf` silently
+overrides the units we install. `slurm-source.sh` now clears them.
+
+### 3. The vendor tree is `/cm/shared/apps/...`
+
+Worth knowing when auditing leftovers:
+```bash
+grep -rl "/cm/" /etc/slurm /etc/default /etc/systemd/system 2>/dev/null
+```
+
+### Verified recovery from a fully tainted state
+
+With the vendor `OPTIONS` **and** a stale drop-in planted, `03` completes
+`EXIT=0`, prints `vendor munge OPTIONS found … munge OK`, and all five
+daemons end active with the node `idle`.

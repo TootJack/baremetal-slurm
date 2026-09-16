@@ -153,16 +153,51 @@ fi
 mkdir -p /etc/munge /var/lib/munge /var/log/munge /run/munge
 chown -R munge:munge /etc/munge /var/lib/munge /var/log/munge 2>/dev/null || true
 chmod 0700 /etc/munge /var/lib/munge
+
+# A vendor stack leaves /etc/default/munge with OPTIONS pointing at ITS key
+# path, e.g.:
+#   OPTIONS="--key-file=/cm/shared/apps/slurm/var/munge/keys/munge.key"
+# The Ubuntu munge unit does `ExecStart=/usr/sbin/munged $OPTIONS`, so that
+# OPTIONS WINS over our key. When the vendor tree is gone (or holds a
+# different key) munged fails with "Job for munge.service failed" and the
+# whole cluster stops authenticating. Neutralise it explicitly.
+if [[ -f /etc/default/munge ]] && grep -qE '^\s*OPTIONS=' /etc/default/munge; then
+  VENDOR_OPTS="$(grep -E '^\s*OPTIONS=' /etc/default/munge | head -1)"
+  echo "    vendor munge OPTIONS found: ${VENDOR_OPTS}"
+  echo "    -> pointing it at our key (/etc/munge/munge.key)"
+fi
+cat > /etc/default/munge <<'EOF'
+# MUNGE configuration - managed by the i3D Slurm POC scripts.
+# Deliberately pinned to the standard key path: the munge systemd unit runs
+# `munged $OPTIONS`, so any vendor-supplied --key-file here would override
+# /etc/munge/munge.key and break authentication.
+OPTIONS="--key-file=/etc/munge/munge.key"
+EOF
+# Same problem can appear as a vendor drop-in unit override
+if [[ -d /etc/systemd/system/munge.service.d ]]; then
+  echo "    clearing vendor munge unit overrides"
+  rm -f /etc/systemd/system/munge.service.d/*.conf 2>/dev/null || true
+  rmdir /etc/systemd/system/munge.service.d 2>/dev/null || true
+  systemctl daemon-reload
+fi
+
 if [[ ! -s /etc/munge/munge.key ]]; then
   dd if=/dev/urandom bs=1 count=1024 of=/etc/munge/munge.key 2>/dev/null
 fi
 chown munge:munge /etc/munge/munge.key
 chmod 400 /etc/munge/munge.key
-systemctl enable --now munge 2>/dev/null || systemctl restart munge
-sleep 1
-munge -n | unmunge 2>/dev/null | grep -q "STATUS:.*Success" \
-  && echo "    munge OK" \
-  || { echo "    !! munge failed"; journalctl -u munge -n 10 --no-pager; exit 1; }
+systemctl reset-failed munge 2>/dev/null || true
+systemctl enable munge >/dev/null 2>&1 || true
+systemctl restart munge
+sleep 2
+if ! munge -n | unmunge 2>/dev/null | grep -q "STATUS:.*Success"; then
+  echo "    !! munge failed to start. Diagnostics:"
+  systemctl status munge --no-pager 2>/dev/null | head -12
+  journalctl -u munge -n 10 --no-pager 2>/dev/null | tail -10
+  echo "    Check /etc/default/munge has no stale vendor --key-file."
+  exit 1
+fi
+echo "    munge OK (key: /etc/munge/munge.key)"
 
 # ---------------------------------------------------------------
 # 3. MariaDB accounting DB

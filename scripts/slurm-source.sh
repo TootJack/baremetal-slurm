@@ -181,6 +181,27 @@ EOF
 install_unit slurmctld "${PREFIX}/sbin/slurmctld" "Slurm controller daemon"
 install_unit slurmd    "${PREFIX}/sbin/slurmd"    "Slurm node daemon"
 install_unit slurmdbd  "${PREFIX}/sbin/slurmdbd"  "Slurm DBD accounting daemon"
+
+# Stale drop-ins override our units. A vendor stack (or earlier debugging)
+# may leave /etc/systemd/system/slurm*.service.d/override.conf that pins
+# User=/ExecStart= to something else - including a path to the vendor tree
+# we just removed. Clear them so the units above are authoritative.
+for d in /etc/systemd/system/slurmctld.service.d \
+         /etc/systemd/system/slurmd.service.d \
+         /etc/systemd/system/slurmdbd.service.d; do
+  if [[ -d "$d" ]]; then
+    echo "    clearing stale drop-ins in $(basename "$d")"
+    rm -f "$d"/*.conf 2>/dev/null || true
+    rmdir "$d" 2>/dev/null || true
+  fi
+done
+# The distro/vendor units (slurm-wlm, Bright) can also linger; mask them so
+# our /etc/systemd/system copies always win.
+if [[ -f /lib/systemd/system/slurmctld.service ]] \
+   && ! grep -q "${PREFIX}" /lib/systemd/system/slurmctld.service 2>/dev/null; then
+  echo "    note: a distro slurmctld.service also exists in /lib; ours in"
+  echo "          /etc/systemd/system takes precedence (verified by systemctl)."
+fi
 # slurmdbd needs the DBD config readable only by root
 sed -i "s|^After=.*|After=network.target munge.service mariadb.service|" \
   /etc/systemd/system/slurmdbd.service
