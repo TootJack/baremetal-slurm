@@ -111,6 +111,62 @@ controller)
   ;;
 
 # ---------------------------------------------------------------
+fabric)
+  hr "INTER-NODE IP CONNECTIVITY (bond0, 10.100.18.0/24)"
+  for peer in hgx01 hgx20; do
+    ip="$(getent hosts "$peer" 2>/dev/null | awk '{print $1}')"
+    [ -z "$ip" ] && { echo "$peer: not in /etc/hosts"; continue; }
+    if ping -c 2 -W 2 "$ip" >/dev/null 2>&1; then
+      echo "$peer ($ip): PING OK"
+    else
+      echo "$peer ($ip): PING FAILED"
+    fi
+  done
+  echo "--- bond0 link speed (this is the NCCL fallback path) ---"
+  for b in /sys/class/net/bond0/bonding/slaves; do
+    [ -f "$b" ] || continue
+    for s in $(cat "$b"); do
+      echo "  slave $s: $(cat /sys/class/net/$s/speed 2>/dev/null || echo '?') Mb/s"
+    done
+  done
+  cat /proc/net/bonding/bond0 2>/dev/null | grep -E "Bonding Mode|Speed|Slave Interface|MII Status" | head -10
+
+  hr "INFINIBAND / RDMA"
+  if command -v ibstat >/dev/null 2>&1; then
+    ibstat -l 2>/dev/null
+    echo "--- port states (must be Active for multi-node NCCL over IB) ---"
+    for d in /sys/class/infiniband/*/ports/*/state; do
+      [ -f "$d" ] || continue
+      echo "  $d = $(cat "$d")"
+    done
+    echo "--- link layer (InfiniBand vs Ethernet/RoCE) ---"
+    for d in /sys/class/infiniband/*/ports/*/link_layer; do
+      [ -f "$d" ] || continue
+      echo "  $d = $(cat "$d")"
+    done
+  else
+    echo "ibstat not installed (apt install infiniband-diags)"
+  fi
+  echo "--- rdma devices ---"
+  rdma link 2>/dev/null || echo "rdma tool unavailable"
+  echo "--- is a subnet manager needed? (IB ports stay DOWN without one) ---"
+  systemctl is-active opensm 2>/dev/null || echo "opensm not running"
+  echo "--- perftest present? ---"
+  command -v ib_write_bw >/dev/null 2>&1 && echo "perftest installed" || echo "perftest NOT installed"
+
+  hr "SHARED FILESYSTEM"
+  echo "--- mounts ---"
+  mount | grep -vE "^(proc|sysfs|cgroup|devpts|tmpfs|securityfs|debugfs|tracefs|pstore|bpf|configfs|fusectl|mqueue|hugetlbfs|nsfs|binfmt_misc|efivarfs|ramfs)" | head -15
+  echo "--- lustre client? ---"
+  lsmod 2>/dev/null | grep -i lustre || echo "no lustre module loaded"
+  command -v lfs >/dev/null 2>&1 && lfs df 2>/dev/null | head -5 || echo "lfs not installed"
+  echo "--- ~/lustre ---"
+  ls -la ~/lustre 2>/dev/null | head -5
+  echo "--- NFS exports/mounts ---"
+  command -v showmount >/dev/null 2>&1 && showmount -e localhost 2>/dev/null | head -5 || echo "nfs-utils not installed"
+  ;;
+
+# ---------------------------------------------------------------
 containers)
   hr "RUNNING 05-pyxis-enroot.sh"
   sudo bash "$(dirname "$0")/05-pyxis-enroot.sh"
@@ -134,7 +190,7 @@ verify)
   ;;
 
 *)
-  echo "usage: $0 preflight|controller|containers|verify|all"
+  echo "usage: $0 preflight|controller|fabric|containers|verify|all"
   exit 1
   ;;
 esac

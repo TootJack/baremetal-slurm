@@ -19,16 +19,21 @@ echo "    Compute:    ${SLURM_COMPUTE}"
 
 # ---------------------------------------------------------------
 # 1. Hostname resolution across the two nodes
-#    (i3D gives you IPs; add them to /etc/hosts on BOTH nodes)
+#    Real values for this cluster: hgx01=10.100.18.5, hgx20=10.100.18.8
+#    Both nodes are 10.100.18.0/24 on bond0, so they CAN reach each other.
 # ---------------------------------------------------------------
 if ! grep -q "i3d-slurm-cluster" /etc/hosts; then
-  echo "==> Adding cluster hosts to /etc/hosts (EDIT IPs BEFORE RUNNING)"
-  echo "# BEGIN i3d-slurm-cluster"
-  echo "# 10.0.0.11  node1 i3d-slurm-cluster"
-  echo "# 10.0.0.12  node2"
-  echo "# END i3d-slurm-cluster" >> /etc/hosts
-  echo "!!! Edit /etc/hosts with real IPs and uncomment, then re-run"
+  echo "==> Adding cluster hosts to /etc/hosts"
+  cat >> /etc/hosts <<'HOSTS'
+# BEGIN i3d-slurm-cluster
+10.100.18.5  hgx01
+10.100.18.8  hgx20
+# END i3d-slurm-cluster
+HOSTS
+  echo "    added hgx01/hgx20"
 fi
+getent hosts hgx01 hgx20 >/dev/null 2>&1 && echo "    hostname resolution OK" \
+  || echo "    !! hostname resolution FAILED"
 
 # ---------------------------------------------------------------
 # 2. Time sync (required for munge authentication)
