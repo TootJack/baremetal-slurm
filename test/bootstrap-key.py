@@ -33,7 +33,11 @@ def main() -> int:
     print(f"==> using public key: {KEY_PATH}")
     print(f"    fingerprint line: {pubkey[:60]}...")
 
-    password = getpass.getpass(f"Password for {USER}@{HOST} (nMBVN...) : ")
+    # Password comes from BM_PASSWORD when run non-interactively (agent/CI),
+    # otherwise prompt. Never written to disk.
+    password = os.environ.get("BM_PASSWORD") or getpass.getpass(
+        f"Password for {USER}@{HOST} : "
+    )
 
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
