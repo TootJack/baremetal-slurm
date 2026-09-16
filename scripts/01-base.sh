@@ -96,7 +96,7 @@ EOF
 
 # ---------------------------------------------------------------
 # 6. SSH hardening: key auth only, no root password login
-#    (Tailscale handles network access; this is defense in depth)
+#    Access is via FortiClient VPN + ed25519 keys (no Tailscale for a 30-day POC)
 # ---------------------------------------------------------------
 echo "==> Configuring sshd: pubkey auth on, password auth off"
 SSHD_CONFIG="/etc/ssh/sshd_config"
@@ -113,17 +113,7 @@ EOF
 systemctl restart ssh || systemctl restart sshd
 
 # ---------------------------------------------------------------
-# 7. Tailscale (per SOW: access like the Nebius setup)
-# ---------------------------------------------------------------
-if ! command -v tailscale >/dev/null 2>&1; then
-  echo "==> Installing Tailscale"
-  curl -fsSL https://tailscale.com/install.sh | sh
-  echo "!!! Run 'tailscale up' manually with your tailnet auth key:"
-  echo "    sudo tailscale up --auth-key=tskey-xxx"
-fi
-
-# ---------------------------------------------------------------
-# 8. Shared directories for jobs / containers / checkpoints
+# 7. Shared directories for jobs / containers / checkpoints
 #    (NFS exports are set up on the controller in 03-controller.sh;
 #     compute nodes mount them - see 04-compute.sh)
 # ---------------------------------------------------------------

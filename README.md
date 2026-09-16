@@ -13,7 +13,7 @@ Jobs run as **sqsh containers** (Pyxis + Enroot) — no environment modules.
 | Containers | Pyxis (SPANK) + Enroot → `.sqsh` images |
 | Access | SSH **ed25519 keys only**, password auth disabled |
 | Users | 3 ML users, **passwordless sudo** |
-| Remote access | Tailscale (per SOW) |
+| Remote access | FortiClient VPN + ed25519 SSH keys |
 
 ## Files
 
@@ -61,7 +61,7 @@ srun --container-image=/shared/containers/ubuntu-test.sqsh echo OK
    each user runs `ssh-keygen -t ed25519 -N "" -f ~/.ssh/id_ed25519` on their laptop
    and sends you `~/.ssh/id_ed25519.pub`.
 3. **Adjust node specs** in 03 (CPUs/RAM) after running `slurmd -C` on each node.
-4. **Tailscale**: `sudo tailscale up --auth-key=tskey-...` on both nodes.
+4. **VPN**: connect FortiClient (profile "baremetal") to reach the nodes.
 
 ## What was verified (before shipping)
 
@@ -95,7 +95,7 @@ unaffected — script 05 fails fast with a clear message if it detects hybrid.
 | Preemption | 03: `PreemptType=preempt/qos`, `PreemptMode=REQUEUE` |
 | Requeue | 03: `JobRequeue=1`; jobs use `--requeue` |
 | Containers, no modules | 05: Pyxis + Enroot, `.sqsh` from `/shared/containers` |
-| Secure access, Tailscale | 01: sshd pubkey-only + Tailscale install |
+| Secure access | 01 + 02: sshd pubkey-only, ed25519 keys, sudoers |
 | Users with sudo | 02: `NOPASSWD:ALL` per user |
 
 ## Day-to-day
@@ -110,4 +110,28 @@ sacctmgr show qos              # QoS list
 
 # submit training
 sbatch examples/train-cpt.sbatch
+```
+
+## Current state (updated)
+
+- **Node 1 is up**, node 2 expected soon.
+- **Access**: `ssh ubuntu@10.100.18.5` — requires **FortiClient** VPN
+  (profile `baremetal` → gateway `78.100.71.218:10443`). **No Tailscale**
+  (30-day POC, kept simple).
+- **eduVPN + FortiClient can coexist**: the FortiClient gateway is reachable
+  while eduVPN is up. Exited Tailscale because its `10.0.0.0/8` subnet route
+  was shadowing the path to `10.100.18.5`.
+- **Passwordless sudo** is granted to the `ubuntu` user by
+  `test/bootstrap-key.py`, and to ML users by `scripts/02-users.sh`.
+
+### First step on the live node
+
+```bash
+# 1. Connect FortiClient (GUI) - profile "baremetal", username starts with mB
+# 2. Verify:
+#    ping 10.100.18.5
+# 3. Install the ed25519 key + enable key-only auth + sudoers:
+python test/bootstrap-key.py
+# 4. Then everything else runs over the key:
+ssh ubuntu@10.100.18.5 'sudo bash -s' < scripts/01-base.sh
 ```
