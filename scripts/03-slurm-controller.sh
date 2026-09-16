@@ -341,7 +341,7 @@ ClusterName=${CLUSTER_NAME}
 SlurmctldHost=${NODE1}
 AuthType=auth/munge
 AccountingStorageType=accounting_storage/slurmdbd
-AccountingStorageHost=127.0.0.1
+AccountingStorageHost=${SLURMDBD_HOST}
 AccountingStoragePort=6819
 EOF
   echo "    seeded minimal /etc/slurm/slurm.conf (clients need it to find slurmdbd)"
@@ -518,6 +518,16 @@ if [[ -n "${NODE1_ADDR:-}" ]]; then
 else
   SLURMCTLD_HOST="${NODE1}"
 fi
+
+# AccountingStorageHost must be the CONTROLLER, not 127.0.0.1.
+#
+# slurmdbd runs only on the controller, but slurm.conf is shared by every node.
+# With `AccountingStorageHost=127.0.0.1` a compute node tries to reach slurmdbd
+# on ITSELF and hangs - `sacct`/`squeue` block and `poc.sh test` had to be
+# Ctrl-C'd on hgx20 while working fine on hgx01. Same address caveat as
+# SlurmctldHost: a hostname every node resolves identically.
+SLURMDBD_HOST="${NODE1}"
+echo "    AccountingStorageHost=${SLURMDBD_HOST} (slurmdbd lives on the controller)"
 echo "    SlurmctldHost=${SLURMCTLD_HOST}"
 
 cat > /etc/slurm/slurm.conf <<EOF
@@ -540,7 +550,7 @@ ReturnToService=2
 
 # --- Accounting (required for QoS / preemption) ---
 AccountingStorageType=accounting_storage/slurmdbd
-AccountingStorageHost=127.0.0.1
+AccountingStorageHost=${SLURMDBD_HOST}
 AccountingStoragePort=6819
 AccountingStorageEnforce=associations,qos
 JobAcctGatherType=jobacct_gather/cgroup

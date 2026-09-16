@@ -178,6 +178,34 @@ chmod 1777 "${SHARED_ROOT}/scratch" 2>/dev/null || true
 # Record the decision for scripts 03/05 to reuse
 echo "SHARED_ROOT=${SHARED_ROOT}" > /etc/slurm-poc-shared.conf 2>/dev/null || true
 echo "    SHARED_ROOT=${SHARED_ROOT}"
+
+# Also expose the shared root as /shared.
+#
+# #SBATCH directives are parsed by sbatch BEFORE the job script runs, so an
+# example cannot compute the path itself - it has to be a literal. The
+# examples therefore use /shared/..., which did not exist (Lustre here is
+# /mnt/i3d_20tb), so `sbatch examples/train-cpt.sbatch` was accepted and then
+# the job died immediately with no output file and nothing in squeue:
+#     --output=/shared/ckpt/...   <- directory missing
+# A symlink keeps the examples portable and costs one line. Created only when
+# SHARED_ROOT is somewhere else, and only if /shared is free.
+if [[ "${SHARED_ROOT}" != "/shared" ]]; then
+  if [[ -L /shared ]]; then
+    if [[ "$(readlink -f /shared)" != "$(readlink -f "${SHARED_ROOT}")" ]]; then
+      echo "    !! /shared symlink points elsewhere; repointing to ${SHARED_ROOT}"
+      ln -sfn "${SHARED_ROOT}" /shared
+    else
+      echo "    /shared -> ${SHARED_ROOT} (already correct)"
+    fi
+  elif [[ -e /shared ]]; then
+    echo "    !! /shared exists as a real directory (not a symlink) - leaving it"
+    echo "       examples referencing /shared will use THAT, not ${SHARED_ROOT}"
+  else
+    ln -s "${SHARED_ROOT}" /shared 2>/dev/null \
+      && echo "    /shared -> ${SHARED_ROOT} (so example #SBATCH paths work)" \
+      || echo "    !! could not create /shared symlink"
+  fi
+fi
 ls -ld "${SHARED_ROOT}" "${SHARED_ROOT}/containers" 2>/dev/null | sed 's/^/    /'
 
 echo "==> 01-base.sh DONE"
