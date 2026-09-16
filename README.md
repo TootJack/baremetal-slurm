@@ -90,10 +90,18 @@ NODE2_HOST=hgx20 sudo -E bash scripts/03-slurm-controller.sh
 # --- on BOTH nodes: containers / sqsh ---
 sudo bash scripts/05-pyxis-enroot.sh
 
+# --- on BOTH nodes (after 01-base.sh) ---
+sudo bash test/verify-hosts-resolution.sh    # 5 assertions; MUST be all-PASS
+
 # --- verify (hgx01) ---
 sinfo -N -o "%N %T %C %G"
 bash scripts/run-on-node.sh verify
 ```
+
+> **`verify-hosts-resolution.sh` is not optional on the real nodes.** It is the
+> regression test for bugs 6-7. If it fails, `hgx20` cannot reach the
+> controller regardless of anything else, and `sinfo` on `hgx20` will say
+> `Unable to contact slurm controller (connect failure)`.
 
 `run-on-node.sh` stages: `preflight | fabric | controller | containers | verify`
 Everything is teed to `/tmp/poc-<stage>-<ts>.log`.
@@ -172,6 +180,20 @@ four further defects it hid — all reproduced in a real cluster, all fixed:
 | 3 | stale `StateSaveLocation` from another ClusterName | `fatal: CLUSTER NAME MISMATCH` | detect + archive old state dir |
 | 4 | `mysql -p"$PASS"` when the user does not exist | **hangs forever** on a password prompt | `--defaults-extra-file` + `timeout` |
 | 5 | GRES type guessed from `nvidia-smi` | node `DRAIN`ed: `gres/gpu count reported lower than configured` | use `slurmd -C`'s own `Gres=`; never invent one |
+| 6 | `/etc/hosts`: Debian's `127.0.1.1 <hostname>` line | own name resolves to **loopback** → `SlurmctldHost=hgx01` binds loopback → other nodes get `Unable to contact slurm controller (connect failure)` | delete the loopback line for cluster names before writing the LAN mapping |
+| 7 | `SlurmctldHost=<name>(<addr>)` pinned an address | replies came from a different address than clients used → `Socket timed out on send/recv operation` | use the bare hostname; let `/etc/hosts` resolve it on every node |
+| 8 | `systemctl enable --now slurmd/slurmctld` on a re-run | daemon kept the **previous** `slurm.conf` → `Node X appears to have a different slurm.conf than the slurmctld`, node stuck `inval` | `enable` + `restart`, so both daemons parse the same file |
+| 9 | state dir cleared partially (left `clustername`, dropped `assoc_usage`) | `fatal: No Assoc usage file (/var/spool/slurmctld/assoc_usage) to recover` | delete the **whole** dir, then verify it is empty |
+
+Bugs 6-9 are the multi-node blockers: with the full stack installed, `hgx01`
+showed the node as `inval` and `hgx20` could not reach the controller at all.
+All four are fixed and locked down by `test/verify-hosts-resolution.sh` (5
+assertions) and `test/verify-end-to-end.sh` (clean run → node `idle` →
+submitted job `COMPLETED` → `sacct` reports it).
+
+> **On the real nodes, run `01-base.sh` on BOTH first.** It must print
+> `hostname resolution OK (<node> sees both nodes)`; if it prints
+> `!! ... resolves to '127.0.1.1'` then Slurm will never reach the controller.
 
 Also fixed: `sacctmgr` calls are all `timeout`-wrapped (they could block),
 `01-base.sh` now repairs half-configured dpkg before `apt-get install`

@@ -99,8 +99,10 @@ case "$SLURM_MODE" in
     elif [[ ! -f /etc/systemd/system/slurmctld.service ]] \
       || [[ ! -f /etc/systemd/system/slurmd.service ]] \
       || [[ ! -f /etc/systemd/system/slurmdbd.service ]] \
-      || [[ ! -f /etc/profile.d/slurm.sh ]]; then
-      echo "    Slurm present but systemd units/PATH missing -> regenerating"
+      || [[ ! -f /etc/profile.d/slurm.sh ]] \
+      || [[ ! -L /usr/local/bin/sinfo ]] \
+      || [[ ! -L /usr/local/bin/slurmd ]]; then
+      echo "    Slurm present but systemd units / PATH wiring missing -> repairing"
       NEED_BUILD=1
     fi
     if [[ "$NEED_BUILD" == "1" ]]; then
@@ -483,10 +485,31 @@ if grep -q "Gres=gpu" <<<"$NODE_LINES"; then
   GRES_LINE="AccountingStorageTRES=gres/gpu"
 fi
 
+# SlurmctldHost takes a hostname, optionally followed by the address to use in
+# parentheses: SlurmctldHost=slurmctl-primary(12.34.56.78).
+#
+# Do NOT add a parenthetical address here. It pins the advertised address, and
+# if that address is not the one clients resolve the hostname to, every RPC
+# fails with:
+#   sinfo: error: Unable to contact slurm controller (connect failure)
+#   slurm_load_partitions: Socket timed out on send/recv operation
+#   error: Node X appears to have a different slurm.conf than the slurmctld
+# Verified on the test bed: with SlurmctldHost=node(172.x) clients timed out;
+# with a bare hostname (resolved via /etc/hosts, which 01-base.sh fills in
+# with hgx01=10.100.18.5 / hgx20=10.100.18.8) the cluster reports `idle`.
+# A bare hostname therefore adapts to each environment. NODE1_ADDR remains
+# available as an opt-in override for split-brain/multi-homed setups.
+if [[ -n "${NODE1_ADDR:-}" ]]; then
+  SLURMCTLD_HOST="${NODE1}(${NODE1_ADDR})"
+else
+  SLURMCTLD_HOST="${NODE1}"
+fi
+echo "    SlurmctldHost=${SLURMCTLD_HOST}"
+
 cat > /etc/slurm/slurm.conf <<EOF
 # Slurm config - i3D H200 POC (generated $(date -Iseconds))
 ClusterName=${CLUSTER_NAME}
-SlurmctldHost=${NODE1}(127.0.0.1)
+SlurmctldHost=${SLURMCTLD_HOST}
 
 AuthType=auth/munge
 CryptoType=crypto/munge
@@ -542,35 +565,55 @@ chown -R root:root /var/spool/slurmctld /var/spool/slurmd
 # Slurm refuses to start if StateSaveLocation holds state from a DIFFERENT
 # ClusterName ("fatal: CLUSTER NAME MISMATCH"). That happens when this script
 # is re-run against an old state dir. Detect and clear it.
-if [[ -f /var/spool/slurmctld/clustername ]]; then
-  # Slurm writes "<ClusterName>|<ClusterID>", e.g. "i3dpoc|3744" - comparing
-  # the raw contents against ClusterName always mismatched and archived the
-  # state dir on every run. Strip the ID suffix.
+if [[ -d /var/spool/slurmctld ]]; then
+  # The dir may exist but be empty (fresh node / just wiped). Guard the read:
+  # a failed `< file` redirection is a shell error, and `set -e` would abort
+  # the whole script with "/var/spool/slurmctld/clustername: No such file or
+  # directory" even though an empty state dir is perfectly valid.
+  OLD_CLUSTER=""
+  if [[ -f /var/spool/slurmctld/clustername ]]; then
+    OLD_CLUSTER="$(tr -d '[:space:]' < /var/spool/slurmctld/clustername 2>/dev/null || true)"
+  fi
+  OLD_NAME="${OLD_CLUSTER%%|*}"
+  OLD_ID="${OLD_CLUSTER##*|}"
+  # Slurm writes "<ClusterName>|<ClusterID>", e.g. "i3dpoc|3744".
   #
-  # CRITICAL: the ID must ALSO match the accounting DB. Recreating the DB
-  # (RESET_ACCT_DB=1) mints a NEW ClusterID, and a stale state file then
-  # makes slurmctld die with:
+  # CRITICAL: the ID must match the accounting DB. Recreating the DB
+  # (RESET_ACCT_DB=1) mints a NEW ClusterID; a stale state file then makes
+  # slurmctld die with:
   #   fatal: CLUSTER ID MISMATCH.
   #   slurmctld has been started with "ClusterID=3744" from the state files,
   #   but the DBD thinks it should be "1540".
-  # which leaves the node stuck in `inval`. So when the DB is being reset,
-  # drop the state dir too.
-  OLD_CLUSTER="$(tr -d '[:space:]' < /var/spool/slurmctld/clustername 2>/dev/null)"
-  OLD_NAME="${OLD_CLUSTER%%|*}"
-  OLD_ID="${OLD_CLUSTER##*|}"
+  #
+  # And the state dir must be either FULLY present or FULLY absent. Leaving
+  # clustername without assoc_usage (a partial clear) makes slurmctld die:
+  #   fatal: No Assoc usage file (/var/spool/slurmctld/assoc_usage) to recover
+  #   [assoc_mgr.c:  if (clustername_existed && !ignore_state_errors) fatal(...)]
+  # So we always delete the WHOLE directory when resetting.
+  RESET_STATE=0
   if [[ "${RESET_ACCT_DB:-0}" == "1" ]]; then
-    echo "    RESET_ACCT_DB=1 -> also clearing the slurmctld state dir"
-    echo "      (a fresh DB mints a new ClusterID; a stale state file causes"
-    echo "       'fatal: CLUSTER ID MISMATCH' and leaves the node inval)"
-    mv /var/spool/slurmctld "/var/spool/slurmctld.bak.$(date +%s)" 2>/dev/null || true
-    mkdir -p /var/spool/slurmctld
-    chown root:root /var/spool/slurmctld
+    RESET_STATE=1
+    echo "    RESET_ACCT_DB=1 -> clearing the whole slurmctld state dir"
+    echo "      (a fresh DB mints a new ClusterID, and a partial state dir"
+    echo "       causes 'CLUSTER ID MISMATCH' or 'No Assoc usage file')"
   elif [[ -n "$OLD_NAME" && "$OLD_NAME" != "$CLUSTER_NAME" ]]; then
+    RESET_STATE=1
     echo "    !! state dir holds cluster '${OLD_NAME}' (id ${OLD_ID}), want '${CLUSTER_NAME}'"
-    echo "       archiving old state so slurmctld can start"
-    mv /var/spool/slurmctld "/var/spool/slurmctld.bak.$(date +%s)"
+    echo "       clearing it so slurmctld can start"
+  fi
+  if [[ "$RESET_STATE" == "1" ]]; then
+    mv /var/spool/slurmctld "/var/spool/slurmctld.bak.$(date +%s)" 2>/dev/null \
+      || rm -rf /var/spool/slurmctld
     mkdir -p /var/spool/slurmctld
     chown root:root /var/spool/slurmctld
+    chmod 0755 /var/spool/slurmctld
+    # confirm it really is empty - a leftover file breaks the next start
+    if [[ -n "$(ls -A /var/spool/slurmctld 2>/dev/null)" ]]; then
+      echo "    !! state dir not empty after reset; forcing removal"
+      rm -rf /var/spool/slurmctld
+      mkdir -p /var/spool/slurmctld
+      chown root:root /var/spool/slurmctld
+    fi
   fi
 fi
 cat > /etc/slurm/gres.conf <<'EOF'
@@ -620,13 +663,22 @@ done
 # ---------------------------------------------------------------
 # 8. Start controller + local slurmd
 # ---------------------------------------------------------------
-systemctl enable --now slurmctld
+# NOTE: `enable --now` only STARTS a stopped unit. On a re-run the daemon is
+# already up, so it would keep the PREVIOUS slurm.conf - slurmctld and slurmd
+# then run different config hashes and clients fail with:
+#   error: Node X appears to have a different slurm.conf than the slurmctld
+#   slurm_load_partitions: Socket timed out on send/recv operation
+# We rewrite slurm.conf above, so force a restart to guarantee both daemons
+# read the same file.
+systemctl enable slurmctld
+systemctl restart slurmctld
 sleep 3
 systemctl is-active --quiet slurmctld || { journalctl -u slurmctld -n 15 --no-pager; exit 1; }
 echo "    slurmctld OK"
 
 # start slurmd on this node too (node1 also computes)
-systemctl enable --now slurmd 2>/dev/null || true
+systemctl enable slurmd 2>/dev/null || true
+systemctl restart slurmd 2>/dev/null || true
 sleep 3
 
 cat > /root/.slurm_db_pass <<EOF

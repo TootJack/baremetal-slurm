@@ -35,9 +35,11 @@ if [[ "$SLURM_MODE" == "source" ]]; then
   echo "    SLURM_MODE=source -> building Slurm ${SLURM_VER:-25.11.8} at ${PREFIX:-/opt/slurm}"
   if [[ ! -x "${PREFIX:-/opt/slurm}/sbin/slurmd" ]]; then
     SLURM_MODE=source bash "$(dirname "$0")/slurm-source.sh"
+  elif [[ ! -f /etc/profile.d/slurm.sh ]] || [[ ! -L /usr/local/bin/sinfo ]]; then
+    echo "    Slurm installed but PATH wiring missing -> repairing"
+    SLURM_MODE=source bash "$(dirname "$0")/slurm-source.sh"
   else
     echo "    already installed at ${PREFIX:-/opt/slurm}"
-    [[ -f /etc/profile.d/slurm.sh ]] || SLURM_MODE=source bash "$(dirname "$0")/slurm-source.sh"
   fi
   if [[ -n "$(dpkg -l 2>/dev/null | awk '/^ii/ && $2 ~ /^slurm[0-9]/ {print $2}')" ]]; then
     echo "    removing vendor Slurm packages"
@@ -167,7 +169,13 @@ fi
 # ---------------------------------------------------------------
 # 4. Start slurmd
 # ---------------------------------------------------------------
-systemctl enable --now slurmd
+# NOTE: `enable --now` only STARTS a stopped unit. On a re-run slurmd is
+# already up and would keep the PREVIOUS slurm.conf, so slurmctld reports:
+#   error: Node X appears to have a different slurm.conf than the slurmctld
+# and the node stays `inval`. The shared slurm.conf was just re-read, so
+# force a restart to guarantee the daemon parses the current file.
+systemctl enable slurmd
+systemctl restart slurmd
 sleep 3
 systemctl is-active --quiet slurmd || { journalctl -u slurmd -n 15 --no-pager; exit 1; }
 
