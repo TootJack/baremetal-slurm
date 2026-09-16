@@ -57,11 +57,21 @@ chmod 1777 "$POC/scratch"
 echo "--- result ---"
 ls -ld "$POC" "$POC"/* | sed 's/^/  /'
 
-hr "VERIFY as ubuntu"
-sudo -u ubuntu touch "$POC/ckpt/.wtest-ubuntu" 2>/dev/null \
-  && echo "  ubuntu can write to $POC/ckpt  YES" \
-  && rm -f "$POC/ckpt/.wtest-ubuntu" \
-  || echo "  ubuntu CANNOT write (add ubuntu to the slurmusers group)"
+hr "VERIFY write access"
+# The dirs are 2775 root:slurmusers, so membership is what matters, not
+# "is it world-writable" - the old message was misleading.
+if sudo -u ubuntu touch "$POC/ckpt/.wtest-ubuntu" 2>/dev/null; then
+  echo "  ubuntu CAN write to $POC/ckpt  -> OK"
+  rm -f "$POC/ckpt/.wtest-ubuntu"
+else
+  echo "  ubuntu cannot write yet - adding ubuntu to the slurmusers group"
+  usermod -aG slurmusers ubuntu
+  echo "  NOTE: group membership needs a NEW login to take effect."
+  echo "        Reconnect (or run: newgrp slurmusers) and re-test."
+fi
+
+hr "GROUP MEMBERSHIP"
+getent group slurmusers | sed 's/^/  /'
 
 hr "RECORD FOR OTHER SCRIPTS"
 echo "SHARED_ROOT=${POC}" | tee /etc/slurm-poc-shared.conf

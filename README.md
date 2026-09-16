@@ -159,3 +159,37 @@ Run on both nodes — **all three gates PASS**:
 2. **node→node ssh fails** → `04-slurm-compute.sh` no longer needs it: `03`
    publishes `munge.key` + `slurm.conf` to `<shared>/cluster-config`, so node 2
    just reads them. Install `02-users.sh` keys later if you want direct ssh.
+
+## Bugs found and fixed by actually RUNNING the scripts (2026-09-16)
+
+`03-slurm-controller.sh` exited printing **nothing**. Root cause and the
+four further defects it hid — all reproduced in a real cluster, all fixed:
+
+| # | Bug | Symptom | Fix |
+|---|---|---|---|
+| 1 | `tr -dc ... </dev/urandom \| head -c 24` | `set -o pipefail` + SIGPIPE (141) killed the script **before any output** | read a fixed 512-byte block; no pipe |
+| 2 | password regenerated each run, but `CREATE USER IF NOT EXISTS` won't update it | run 2 → `Access denied for 'slurm'@'localhost'` | reuse `/root/.slurm_db_pass`; `ALTER USER` to force it |
+| 3 | stale `StateSaveLocation` from another ClusterName | `fatal: CLUSTER NAME MISMATCH` | detect + archive old state dir |
+| 4 | `mysql -p"$PASS"` when the user does not exist | **hangs forever** on a password prompt | `--defaults-extra-file` + `timeout` |
+| 5 | GRES type guessed from `nvidia-smi` | node `DRAIN`ed: `gres/gpu count reported lower than configured` | use `slurmd -C`'s own `Gres=`; never invent one |
+
+Also fixed: `sacctmgr` calls are all `timeout`-wrapped (they could block),
+`01-base.sh` now repairs half-configured dpkg before `apt-get install`
+(hgx20 hit `E: Unmet dependencies`), NTP uses chrony since
+`timedatectl set-ntp` reports "NTP not supported" on these images, and
+`04-slurm-compute.sh` no longer requires `CTRL_HOST` (Lustre provides it).
+
+**Verified:** clean run and re-run both exit 0; node reports `idle`.
+
+### The GRES trap (important for hgx01/hgx20)
+
+Slurm only emits `Gres=` from `slurmd -C` when it can talk to the GPU via
+NVML. If `libnvidia-ml.so.1` is not on the loader path, `slurmd -C` shows
+**no Gres at all** — and configuring any GRES count then DRAINs the node.
+The script now refuses to guess and prints a loud warning instead. On the
+H200 nodes, confirm before trusting the output:
+
+```bash
+slurmd -G          # must NOT say "lib wasn't found"
+slurmd -C          # must include Gres=gpu:nvidia_h200:8
+```

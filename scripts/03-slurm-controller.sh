@@ -11,8 +11,40 @@
 # =====================================================================
 set -euo pipefail
 
+# ---------------------------------------------------------------
+# 0a. Must run as root. `NODE2_HOST=x sudo -E bash 03...` is fine;
+#     plain `sudo bash 03...` is fine. But if someone runs it WITHOUT
+#     sudo, fail immediately with a clear message instead of silently
+#     erroring later on apt/permissions.
+# ---------------------------------------------------------------
+if [[ "${EUID}" -ne 0 ]]; then
+  echo "!! This script must run as root."
+  echo "   Use:  sudo bash $0"
+  echo "   or:   NODE2_HOST=hgx20 sudo -E bash $0"
+  exit 1
+fi
+
 CLUSTER_NAME="${CLUSTER_NAME:-i3dpoc}"
-DB_PASS="${DB_PASS:-$(tr -dc 'a-zA-Z0-9' </dev/urandom | head -c 24)}"
+
+# Generate the DB password SAFELY and IDEMPOTENTLY.
+# Bug 1: `tr -dc ... </dev/urandom | head -c 24` dies from SIGPIPE (141)
+#        under `set -o pipefail`, aborting the whole script silently.
+# Bug 2: regenerating the password on every run broke re-runs, because
+#        `CREATE USER IF NOT EXISTS` does NOT update an existing password,
+#        so slurmdbd.conf disagreed with the DB -> "Access denied".
+# Fix: reuse the stored password if we have one; always force it into MySQL.
+DB_PASS_FILE=/root/.slurm_db_pass
+if [[ -z "${DB_PASS:-}" ]]; then
+  if [[ -r "$DB_PASS_FILE" ]]; then
+    DB_PASS="$(sed -n 's/^DB_PASS=//p' "$DB_PASS_FILE")"
+    echo "==> reusing existing DB password from ${DB_PASS_FILE}"
+  fi
+fi
+if [[ -z "${DB_PASS:-}" ]]; then
+  DB_PASS="$(head -c 512 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | cut -c1-24)"
+  [[ -n "$DB_PASS" ]] || { echo "!! failed to generate DB password"; exit 1; }
+  echo "==> generated a new DB password"
+fi
 
 # ---------------------------------------------------------------
 # 0. Detect this node's real identity (Slurm NodeName MUST match)
@@ -46,12 +78,35 @@ munge -n | unmunge | grep -q "STATUS:.*Success" && echo "    munge OK"
 
 # ---------------------------------------------------------------
 # 3. MariaDB accounting DB
+# ALTER USER (not just CREATE USER IF NOT EXISTS) so re-runs converge
+# on the same password instead of silently keeping a stale one.
 # ---------------------------------------------------------------
 systemctl enable --now mariadb
 mysql -e "CREATE DATABASE IF NOT EXISTS slurm_acct_db;"
 mysql -e "CREATE USER IF NOT EXISTS 'slurm'@'localhost' IDENTIFIED BY '${DB_PASS}';"
+mysql -e "ALTER USER 'slurm'@'localhost' IDENTIFIED BY '${DB_PASS}';"
 mysql -e "GRANT ALL ON slurm_acct_db.* TO 'slurm'@'localhost'; FLUSH PRIVILEGES;"
 mysql -e "SET GLOBAL innodb_lock_wait_timeout=900;"
+
+# verify the credential actually works before starting slurmdbd.
+# IMPORTANT: mysql -p"$PASS" PROMPTS if the user does not exist yet, which
+# hangs the script forever on a non-tty. Use --defaults-extra-file so the
+# password is never a prompt candidate, and add a timeout as a belt.
+MYSQL_CNF="$(mktemp)"
+chmod 600 "$MYSQL_CNF"
+cat > "$MYSQL_CNF" <<EOF
+[client]
+user=slurm
+password=${DB_PASS}
+EOF
+if timeout 15 mysql --defaults-extra-file="$MYSQL_CNF" -e "SELECT 1" slurm_acct_db >/dev/null 2>&1; then
+  echo "    DB credentials verified"
+  rm -f "$MYSQL_CNF"
+else
+  rm -f "$MYSQL_CNF"
+  echo "    !! DB credentials FAILED - slurmdbd will not start"
+  exit 1
+fi
 
 # ---------------------------------------------------------------
 # 4. slurmdbd
@@ -73,29 +128,53 @@ StorageUser=slurm
 StoragePass=${DB_PASS}
 EOF
 chmod 600 /etc/slurm/slurmdbd.conf
-systemctl enable --now slurmdbd
-sleep 2
-systemctl is-active --quiet slurmdbd || { journalctl -u slurmdbd -n 10 --no-pager; exit 1; }
-echo "    slurmdbd OK"
+systemctl enable slurmdbd >/dev/null 2>&1 || true
+# restart (not just start): on a re-run the daemon may be holding the old
+# config/password, which produced "Access denied" against the new one.
+systemctl restart slurmdbd
+# wait for slurmdbd to actually accept connections before any sacctmgr call.
+# Timeout every probe: sacctmgr can block indefinitely if the daemon is up
+# but not yet serving, which would hang the script.
+for i in $(seq 1 30); do
+  systemctl is-active --quiet slurmdbd || { sleep 1; continue; }
+  if timeout 5 sacctmgr -n show cluster >/dev/null 2>&1; then break; fi
+  sleep 1
+done
+systemctl is-active --quiet slurmdbd || { journalctl -u slurmdbd -n 15 --no-pager; exit 1; }
+timeout 10 sacctmgr -n show cluster >/dev/null 2>&1 \
+  && echo "    slurmdbd OK (accepting connections)" \
+  || { echo "    !! slurmdbd up but not answering - aborting before sacctmgr spam"
+       journalctl -u slurmdbd -n 15 --no-pager; exit 1; }
 
 # ---------------------------------------------------------------
 # 5. Detect hardware for NodeName lines
 #    slurmd -C prints the authoritative topology Slurm expects.
 # ---------------------------------------------------------------
-# Slurm normalizes a detected GPU name the same way: lowercase, spaces -> "_".
-# The Type in Gres= must be an exact match OR a substring of that name, else
-# the node registers fewer GPUs than configured and goes to DRAIN.
-gpu_type_and_count() {   # echoes "<type> <count>"; empty if undetectable
-  local name count
-  command -v nvidia-smi >/dev/null 2>&1 || return 0
-  count="$(nvidia-smi --list-gpus 2>/dev/null | wc -l | tr -d ' ')"
-  [[ -z "$count" || "$count" == "0" ]] && return 0
-  if [[ -n "${GPU_TYPE:-}" ]]; then
-    echo "${GPU_TYPE} ${count}"; return 0
+# Prefer the GRES string Slurm itself reports. `slurmd -C` emits a `Gres=`
+# field ONLY when it can actually talk to the GPU via NVML - which is the
+# exact thing slurmctld compares against. Guessing the type from nvidia-smi
+# risks a mismatch, and a mismatch DRAINs the node with
+# "gres/gpu count reported lower than configured".
+gpu_type_and_count() {   # echoes "<type> <count>"; EMPTY if not authoritative
+  local line name count
+  # 1. AUTHORITATIVE: slurmd's own NVML detection. slurmctld compares its
+  #    registration against this exact value, so using it guarantees a match.
+  line="$(slurmd -C 2>/dev/null | grep -m1 -o 'Gres=[^ ]*' || true)"
+  if [[ -n "$line" ]]; then
+    # Gres=gpu:type:N  or  Gres=gpu:N
+    echo "${line#Gres=}" | sed 's|^gpu:||' | awk -F: '{if (NF==2) print $1, $2; else print "gpu", $1}'
+    return 0
   fi
-  name="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
-  name="$(tr 'A-Z ' 'a-z_' <<<"$name" | tr -s '_' | sed 's/^_//;s/_$//')"
-  echo "${name:-gpu} ${count}"
+  # 2. EXPLICIT override only. We deliberately do NOT fall back to
+  #    nvidia-smi: if slurmd cannot see the GPU via NVML, configuring any
+  #    Gres= count makes slurmctld DRAIN the node with
+  #    "gres/gpu count reported lower than configured". Better to register
+  #    with no GRES and warn loudly than to silently break scheduling.
+  if [[ -n "${GPU_TYPE:-}" ]] && command -v nvidia-smi >/dev/null 2>&1; then
+    count="$(nvidia-smi --list-gpus 2>/dev/null | wc -l | tr -d ' ')"
+    [[ -n "$count" && "$count" != "0" ]] && { echo "${GPU_TYPE} ${count}"; return 0; }
+  fi
+  return 0   # caller treats empty as "no GRES configured"
 }
 
 detect_node() {  # $1 = hostname  -> echoes "NodeName=.. CPUs=.. RealMemory=.. [Gres=..]"
@@ -125,6 +204,31 @@ else
 fi
 echo "    node config:"
 sed 's/^/      /' <<<"$NODE_LINES"
+
+# Loudly flag the dangerous case: GPUs physically present, but Slurm's own
+# NVML detection returned no Gres= (e.g. libnvidia-ml.so not visible to
+# slurmd). Configuring a GRES count in that state DRAINs the node.
+if command -v nvidia-smi >/dev/null 2>&1; then
+  PHYS="$(nvidia-smi --list-gpus 2>/dev/null | wc -l | tr -d ' ')"
+  if [[ -n "$PHYS" && "$PHYS" != "0" ]] && ! grep -q "Gres=" <<<"$NODE_LINES"; then
+    echo
+    echo "    !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    echo "    !! ${PHYS} GPUs present, but 'slurmd -C' reported NO Gres."
+    echo "    !! Slurm cannot see NVML, so no GRES is configured."
+    echo "    !! Jobs requesting --gres=gpu will NOT schedule."
+    echo "    !!"
+    echo "    !! Check:  slurmd -G"
+    echo "    !!   'We were configured with nvml functionality, but that"
+    echo "    !!    lib wasn't found on the system.'"
+    echo "    !! Fix:  ensure the NVIDIA driver's libnvidia-ml.so.1 is on the"
+    echo "    !!       loader path, then re-run this script:"
+    echo "    !!         ldconfig; ls /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.*"
+    echo "    !! Override only if you know the driver name:"
+    echo "    !!         GPU_TYPE=h200 sudo -E bash \$0"
+    echo "    !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    echo
+  fi
+fi
 
 # ---------------------------------------------------------------
 # 6. slurm.conf  (validated end-to-end in a real test cluster:
@@ -192,6 +296,20 @@ EOF
 
 mkdir -p /var/spool/slurmctld /var/spool/slurmd
 chown -R root:root /var/spool/slurmctld /var/spool/slurmd
+
+# Slurm refuses to start if StateSaveLocation holds state from a DIFFERENT
+# ClusterName ("fatal: CLUSTER NAME MISMATCH"). That happens when this script
+# is re-run against an old state dir. Detect and clear it.
+if [[ -f /var/spool/slurmctld/clustername ]]; then
+  OLD_NAME="$(cat /var/spool/slurmctld/clustername 2>/dev/null | tr -d '[:space:]')"
+  if [[ -n "$OLD_NAME" && "$OLD_NAME" != "$CLUSTER_NAME" ]]; then
+    echo "    !! state dir holds cluster '${OLD_NAME}', we want '${CLUSTER_NAME}'"
+    echo "       archiving old state so slurmctld can start"
+    mv /var/spool/slurmctld "/var/spool/slurmctld.bak.$(date +%s)"
+    mkdir -p /var/spool/slurmctld
+    chown root:root /var/spool/slurmctld
+  fi
+fi
 cat > /etc/slurm/gres.conf <<'EOF'
 AutoDetect=nvml
 EOF
@@ -218,22 +336,22 @@ ls -l "$STAGE" | sed 's/^/      /'
 # 7. Register cluster + users + QoS
 # ---------------------------------------------------------------
 sleep 2
-sacctmgr -i create cluster "${CLUSTER_NAME}" 2>&1 | head -1 || true
-sacctmgr -i create account root 2>&1 | head -1 || true
+timeout 15 sacctmgr -i create cluster "${CLUSTER_NAME}" 2>&1 | head -1 || true
+timeout 15 sacctmgr -i create account root 2>&1 | head -1 || true
 for u in slurmadmin mluser1 mluser2 mluser3 ubuntu; do
   id "$u" >/dev/null 2>&1 && \
-    sacctmgr -i create user "$u" account=root 2>&1 | head -1 || true
+    timeout 15 sacctmgr -i create user "$u" account=root 2>&1 | head -1 || true
 done
 # slurmadmin gets admin rights
 id slurmadmin >/dev/null 2>&1 && \
-  sacctmgr -i modify user slurmadmin set adminlevel=admin 2>&1 | head -1 || true
+  timeout 15 sacctmgr -i modify user slurmadmin set adminlevel=admin 2>&1 | head -1 || true
 
-sacctmgr -i create qos normal priority=0   2>&1 | head -1 || true
-sacctmgr -i create qos high  priority=1000 2>&1 | head -1 || true
-sacctmgr -i create qos low   priority=100  2>&1 | head -1 || true
-sacctmgr -i modify qos high set preempt=low 2>&1 | head -1 || true
+timeout 15 sacctmgr -i create qos normal priority=0   2>&1 | head -1 || true
+timeout 15 sacctmgr -i create qos high  priority=1000 2>&1 | head -1 || true
+timeout 15 sacctmgr -i create qos low   priority=100  2>&1 | head -1 || true
+timeout 15 sacctmgr -i modify qos high set preempt=low 2>&1 | head -1 || true
 for u in slurmadmin mluser1 mluser2 mluser3 ubuntu root; do
-  sacctmgr -i modify user "$u" set qos=normal,high,low 2>&1 >/dev/null || true
+  timeout 15 sacctmgr -i modify user "$u" set qos=normal,high,low 2>&1 >/dev/null || true
 done
 
 # ---------------------------------------------------------------
@@ -258,7 +376,13 @@ echo "==> 03-slurm-controller.sh DONE"
 echo "    --- sinfo ---"
 sinfo -N -o "%N %T %C %G" 2>/dev/null || sinfo
 echo
+echo "    Cluster artifacts published to: ${STAGE}"
 echo "    Next:"
-echo "      * copy munge key to node 2:  sudo scp /etc/munge/munge.key ${NODE2_HOST:-<node2>}:/etc/munge/"
-echo "      * on node 2:                 sudo NODE2_HOST=... bash 04-slurm-compute.sh"
-echo "      * containers (both nodes):   sudo bash 05-pyxis-enroot.sh"
+echo "      * on node 2 (NO ssh needed - it reads from shared storage):"
+if [[ -n "$NODE2_HOST" ]]; then
+  echo "          sudo bash 04-slurm-compute.sh"
+else
+  echo "          sudo bash 04-slurm-compute.sh"
+  echo "        then re-run here with NODE2_HOST=<node2> to add it to slurm.conf"
+fi
+echo "      * containers (both nodes):  sudo bash 05-pyxis-enroot.sh"

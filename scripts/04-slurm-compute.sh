@@ -7,8 +7,15 @@
 # =====================================================================
 set -euo pipefail
 
-CTRL_HOST="${CTRL_HOST:?set CTRL_HOST to the controller hostname, e.g. CTRL_HOST=$(hostname -s)}"
+# CTRL_HOST is now OPTIONAL: munge.key and slurm.conf are read from shared
+# storage (Lustre), so this node needs no ssh access to the controller.
+CTRL_HOST="${CTRL_HOST:-hgx01}"
 CLUSTER_NAME="${CLUSTER_NAME:-i3dpoc}"
+
+if [[ "${EUID}" -ne 0 ]]; then
+  echo "!! This script must run as root.  Use:  sudo bash $0"
+  exit 1
+fi
 
 echo "==> Slurm compute node setup on $(hostname -s)"
 echo "    controller: ${CTRL_HOST}"

@@ -24,29 +24,47 @@ echo "    Compute:    ${SLURM_COMPUTE}"
 # ---------------------------------------------------------------
 if ! grep -q "i3d-slurm-cluster" /etc/hosts; then
   echo "==> Adding cluster hosts to /etc/hosts"
-  cat >> /etc/hosts <<'HOSTS'
-# BEGIN i3d-slurm-cluster
-10.100.18.5  hgx01
-10.100.18.8  hgx20
-# END i3d-slurm-cluster
-HOSTS
-  echo "    added hgx01/hgx20"
+  HOSTS_BLOCK="${HOSTS_BLOCK:-10.100.18.5  hgx01
+10.100.18.8  hgx20}"
+  { echo "# BEGIN i3d-slurm-cluster"
+    echo "$HOSTS_BLOCK"
+    echo "# END i3d-slurm-cluster"
+  } >> /etc/hosts
+  echo "    added: $(echo "$HOSTS_BLOCK" | tr '\n' ' ')"
 fi
 getent hosts hgx01 hgx20 >/dev/null 2>&1 && echo "    hostname resolution OK" \
   || echo "    !! hostname resolution FAILED"
 
 # ---------------------------------------------------------------
 # 2. Time sync (required for munge authentication)
+#    `timedatectl set-ntp true` fails on these images with
+#    "NTP not supported" because systemd-timesyncd is absent; chrony is
+#    installed in step 3 and started here instead.
 # ---------------------------------------------------------------
-echo "==> Enabling NTP time sync"
-timedatectl set-ntp true || true
-timedatectl | grep -E "synchronized|NTP" || true
+echo "==> Enabling time sync (chrony)"
+timedatectl set-ntp true 2>/dev/null || echo "    timedatectl NTP unavailable - relying on chrony"
+if ! systemctl is-active --quiet chrony 2>/dev/null; then
+  systemctl enable --now chrony 2>/dev/null || true
+fi
+sleep 2
+if command -v chronyc >/dev/null 2>&1; then
+  chronyc tracking 2>/dev/null | grep -E "Reference ID|Stratum|System time" | sed 's/^/    /' || true
+  chronyc sources 2>/dev/null | head -5 | sed 's/^/    /' || true
+fi
+timedatectl 2>/dev/null | grep -E "synchronized|NTP service" | sed 's/^/    /' || true
 
 # ---------------------------------------------------------------
 # 3. Base packages
 # ---------------------------------------------------------------
 echo "==> Installing base packages"
 export DEBIAN_FRONTEND=noninteractive
+# hgx20 hit "E: Unmet dependencies" because a pending kernel upgrade left
+# dpkg half-configured. Repair first, then install.
+if ! dpkg --audit >/dev/null 2>&1 || dpkg --audit 2>/dev/null | grep -q .; then
+  echo "    dpkg has half-configured packages - running --configure -a"
+  dpkg --configure -a 2>&1 | tail -3 || true
+fi
+apt-get -f install -y -qq 2>&1 | tail -3 || true
 apt-get update -qq
 apt-get install -y -qq \
   build-essential wget curl git vim jq \
@@ -54,7 +72,14 @@ apt-get install -y -qq \
   nfs-common \
   python3 python3-pip \
   hwloc \
-  cgroup-tools
+  cgroup-tools 2>&1 | tail -5
+# `needrestart` can return non-zero on GPU nodes with a pending kernel
+# update and abort the script under `set -e`. It is advisory only.
+dpkg -l needrestart >/dev/null 2>&1 && {
+  echo "    needrestart present - disabling its interactive prompt"
+  sed -i 's/^#\?\$nrconf{restart}.*/$nrconf{restart} = '"'"'a'"'"';/' \
+    /etc/needrestart/needrestart.conf 2>/dev/null || true
+}
 
 # ---------------------------------------------------------------
 # 4. Kernel settings for GPU training nodes
