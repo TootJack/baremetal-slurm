@@ -126,3 +126,36 @@ Go/no-go for multi-node:
 - [ ] all IB ports ACTIVE with LIDs
 - [ ] Lustre visible and writable on BOTH nodes (a `verify-<otherhost>-*`
       file appearing proves it is genuinely shared)
+
+## Fabric verification result (2026-09-16)
+
+Run on both nodes — **all three gates PASS**:
+
+| Check | hgx01 | hgx20 |
+|---|---|---|
+| IP reachability | ✅ both | ✅ both |
+| IB fabric | ✅ 8 ports ACTIVE | ✅ 8 ports ACTIVE |
+| IB rate | **400 Gb/s (4X NDR)** | **400 Gb/s (4X NDR)** |
+| Lustre mounted | ✅ | ✅ |
+| Lustre writable | ❌ | ❌ |
+| node→node ssh | ❌ | ❌ |
+
+**RDMA data path proven: 182.74 Gb/s** (identical on both ends).
+
+### Notes on the numbers
+
+- The 182 Gb/s test ran over `rocep157s0f0`, whose netdev is a **bond0 slave**
+  (`enp157s0f0np0` / `eno19495np0`). That is the RoCE-over-LACP path, ~one
+  200 GbE link per flow. It is a **floor, not the target**.
+- `ibp26s0` failed with `Couldn't connect to 10.100.18.5:18515` because
+  `ib_write_bw` uses **TCP** for its out-of-band handshake and the IPoIB
+  interfaces have no IP. Not a fabric fault.
+- To measure the native 400G rails: `bash scripts/ib-test.sh server|client <ip>`
+  (assigns a temporary IP, measures, removes it).
+
+### Known gaps before Slurm install
+
+1. **Lustre not writable** → `sudo bash scripts/lustre-fix.sh diag` then `fix`.
+2. **node→node ssh fails** → `04-slurm-compute.sh` no longer needs it: `03`
+   publishes `munge.key` + `slurm.conf` to `<shared>/cluster-config`, so node 2
+   just reads them. Install `02-users.sh` keys later if you want direct ssh.

@@ -197,6 +197,24 @@ AutoDetect=nvml
 EOF
 
 # ---------------------------------------------------------------
+# 6b. Publish cluster artifacts to shared storage (Lustre) so node 2
+#     needs NO ssh access to this controller. Read by 04-slurm-compute.sh.
+# ---------------------------------------------------------------
+LUSTRE_MOUNT="${LUSTRE_MOUNT:-/mnt/i3d_20tb}"
+if mountpoint -q "$LUSTRE_MOUNT" 2>/dev/null; then
+  SHARED_ROOT="${LUSTRE_MOUNT}/slurm-poc"
+else
+  SHARED_ROOT="/shared"
+fi
+STAGE="${SHARED_ROOT}/cluster-config"
+mkdir -p "$STAGE"
+install -o root -g root -m 400 /etc/munge/munge.key "${STAGE}/munge.key"
+install -o root -g root -m 644 /etc/slurm/slurm.conf  "${STAGE}/slurm.conf"
+echo "SHARED_ROOT=${SHARED_ROOT}" > /etc/slurm-poc-shared.conf
+echo "    published munge.key + slurm.conf -> ${STAGE}"
+ls -l "$STAGE" | sed 's/^/      /'
+
+# ---------------------------------------------------------------
 # 7. Register cluster + users + QoS
 # ---------------------------------------------------------------
 sleep 2

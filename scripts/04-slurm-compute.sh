@@ -18,31 +18,44 @@ apt-get update -qq
 apt-get install -y -qq slurmd slurm-client munge
 
 # ---------------------------------------------------------------
+# Resolve shared storage (Lustre). 01-base.sh wrote this on both nodes.
+# Using Lustre means node 2 needs NO ssh access to the controller.
+# ---------------------------------------------------------------
+[[ -f /etc/slurm-poc-shared.conf ]] && source /etc/slurm-poc-shared.conf
+SHARED_ROOT="${SHARED_ROOT:-/shared}"
+STAGE="${SHARED_ROOT}/cluster-config"       # controller publishes to here
+
+# ---------------------------------------------------------------
 # 1. Munge - key must be IDENTICAL to the controller's
 # ---------------------------------------------------------------
-if [[ ! -s /etc/munge/munge.key ]]; then
-  echo "    fetching munge key from ${CTRL_HOST}"
-  scp -o StrictHostKeyChecking=accept-new \
-      "root@${CTRL_HOST}:/etc/munge/munge.key" /etc/munge/munge.key \
-  || scp -o StrictHostKeyChecking=accept-new \
-      "${CTRL_HOST}:/etc/munge/munge.key" /etc/munge/munge.key
+mkdir -p /etc/munge
+if [[ -s "${STAGE}/munge.key" ]]; then
+  echo "    taking munge key from shared storage (${STAGE})"
+  install -o munge -g munge -m 400 "${STAGE}/munge.key" /etc/munge/munge.key
+elif [[ ! -s /etc/munge/munge.key ]]; then
+  echo "    !! no munge key in shared storage and none locally."
+  echo "       Run 03-slurm-controller.sh on ${CTRL_HOST} first - it publishes"
+  echo "       the key to ${STAGE}/munge.key"
+  exit 1
 fi
 chown munge: /etc/munge/munge.key
 chmod 400 /etc/munge/munge.key
 systemctl enable --now munge
 sleep 1
 munge -n | unmunge | grep -q "STATUS:.*Success" || { echo "!! munge failed"; exit 1; }
-echo "    munge OK"
-echo "    (verify identical: md5sum /etc/munge/munge.key on both nodes)"
+echo "    munge OK  (md5: $(md5sum < /etc/munge/munge.key | cut -c1-16))"
 
 # ---------------------------------------------------------------
 # 2. slurm.conf - must be byte-identical to the controller's
 # ---------------------------------------------------------------
 mkdir -p /etc/slurm /var/spool/slurmd /var/log/slurm
-scp -o StrictHostKeyChecking=accept-new \
-    "root@${CTRL_HOST}:/etc/slurm/slurm.conf" /etc/slurm/slurm.conf \
-|| scp -o StrictHostKeyChecking=accept-new \
-    "${CTRL_HOST}:/etc/slurm/slurm.conf" /etc/slurm/slurm.conf
+if [[ -f "${STAGE}/slurm.conf" ]]; then
+  echo "    taking slurm.conf from shared storage"
+  install -m 644 "${STAGE}/slurm.conf" /etc/slurm/slurm.conf
+else
+  echo "    !! ${STAGE}/slurm.conf missing - run 03 on ${CTRL_HOST} first"
+  exit 1
+fi
 
 cat > /etc/slurm/gres.conf <<'EOF'
 AutoDetect=nvml
