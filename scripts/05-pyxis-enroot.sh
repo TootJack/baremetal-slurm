@@ -13,7 +13,15 @@ set -euo pipefail
 SLURM_VERSION="${SLURM_VERSION:-23.11}"   # match installed slurm-wlm
 PYXIS_VERSION="${PYXIS_VERSION:-0.24.0}"  # check https://github.com/NVIDIA/pyxis/tags
 ENROOT_VERSION="${ENROOT_VERSION:-4.2.1}" # check https://github.com/NVIDIA/enroot/tags
-SHARED_IMGS="/shared/containers"
+
+# Reuse the shared-storage decision made by 01-base.sh (Lustre when available)
+if [[ -f /etc/slurm-poc-shared.conf ]]; then
+  # shellcheck disable=SC1091
+  source /etc/slurm-poc-shared.conf
+fi
+SHARED_ROOT="${SHARED_ROOT:-/shared}"
+SHARED_IMGS="${SHARED_IMGS:-${SHARED_ROOT}/containers}"
+echo "==> shared storage root: ${SHARED_ROOT}"
 
 # ---------------------------------------------------------------
 # 0. PRECHECK: enroot requires pure cgroup v2.

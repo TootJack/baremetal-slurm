@@ -119,13 +119,29 @@ systemctl restart ssh || systemctl restart sshd
 
 # ---------------------------------------------------------------
 # 7. Shared directories for jobs / containers / checkpoints
-#    (NFS exports are set up on the controller in 03-controller.sh;
-#     compute nodes mount them - see 04-compute.sh)
+#
+#    This cluster has Lustre mounted at /mnt/i3d_20tb (over IB), which is
+#    already shared between both nodes - far better than a local /shared.
+#    We use it when present, and only fall back to local /shared otherwise.
 # ---------------------------------------------------------------
-for d in /shared/containers /shared/ckpt /shared/data /shared/scratch /shared/home; do
-  mkdir -p "$d"
+LUSTRE_MOUNT="${LUSTRE_MOUNT:-/mnt/i3d_20tb}"
+if mountpoint -q "$LUSTRE_MOUNT" 2>/dev/null; then
+  echo "==> Using shared Lustre at ${LUSTRE_MOUNT}"
+  SHARED_ROOT="${LUSTRE_MOUNT}/slurm-poc"
+else
+  echo "==> No Lustre at ${LUSTRE_MOUNT}; using LOCAL /shared (NOT shared between nodes!)"
+  SHARED_ROOT="/shared"
+fi
+for d in containers ckpt data scratch; do
+  mkdir -p "${SHARED_ROOT}/${d}" 2>/dev/null || true
 done
-chmod 1777 /shared/scratch
+# world-writable scratch so all 3 users can use it
+chmod 1777 "${SHARED_ROOT}/scratch" 2>/dev/null || true
+
+# Record the decision for scripts 03/05 to reuse
+echo "SHARED_ROOT=${SHARED_ROOT}" > /etc/slurm-poc-shared.conf 2>/dev/null || true
+echo "    SHARED_ROOT=${SHARED_ROOT}"
+ls -ld "${SHARED_ROOT}" "${SHARED_ROOT}/containers" 2>/dev/null | sed 's/^/    /'
 
 echo "==> 01-base.sh DONE"
 echo "    Next: 02-users.sh on the controller, then 03-slurm-controller.sh"

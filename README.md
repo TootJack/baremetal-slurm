@@ -16,7 +16,10 @@ Jobs run as **sqsh containers** (Pyxis + Enroot) — no environment modules.
 | NVLink | **NV18** (all-to-all) ✅ | **NV18** (all-to-all) ✅ |
 | Driver | 550.54.14 | 550.54.14 |
 | fabricmanager | **active** ✅ | **active** ✅ |
-| InfiniBand | 8× ConnectX-7, ports **DOWN** ⚠️ | 8× ConnectX-7, ports **DOWN** ⚠️ |
+| InfiniBand | 8× ConnectX-7, **ACTIVE**, LIDs assigned ✅ | 8× ConnectX-7, **ACTIVE** ✅ |
+| Fabric | IB fabric configured upstream (`sm_lid 1`) | same |
+| Shared FS | **Lustre `/mnt/i3d_20tb`** over IB ✅ | same |
+| Management net | bond0 2×200 GbE LACP = 400 Gb/s | same |
 | sudo | passwordless ✅ | passwordless ✅ |
 | `/shared` | does not exist | does not exist |
 
@@ -25,9 +28,14 @@ Sizeable notes:
   reach each other over IP — `ssh hgx02` failed only because the hostname was
   misspelled (`hgx20`) and there was no `/etc/hosts` entry. `01-base.sh` now
   writes both entries.
-- **IB ports are DOWN.** That is expected until a subnet manager (or the
-  provider's fabric) is up. Multi-node NCCL without IB falls back to TCP over
-  `bond0` — functional but far slower. See "Fabric" below.
+- **The IB fabric is UP.** All 8 ConnectX-7 ports read `4: ACTIVE` with
+  `LINK_UP`, `link_layer = InfiniBand`, LIDs assigned and `sm_lid 1` — a subnet
+  manager is running upstream on i3D's side (not locally, which is normal).
+  `ip link` showing `ibp*` as `DOWN` is only the netdev state for an IPoIB
+  interface with no IP configured; the RDMA path is fully functional.
+- **Lustre is mounted at `/mnt/i3d_20tb` and shared between both nodes**, and
+  it runs over the IB fabric (`...@o2ib:/scratch`, `ko2iblnd` loaded).
+  Scripts use it automatically instead of a local `/shared`.
 
 ## Files
 
@@ -102,16 +110,19 @@ GPU_TYPE=h200 sudo -E bash scripts/03-slurm-controller.sh
 
 `preflight` prints both values so they can be compared.
 
-## Open issue: inter-node fabric
+## Verify multi-node BEFORE installing Slurm
 
-Multi-node (16-GPU) training needs the 8× ConnectX-7 links up. Currently all
-IB ports read `DOWN`. Options, in order of preference:
+```bash
+# on both nodes (no coordination needed)
+bash scripts/fabric-verify.sh check
 
-1. **Ask i3D to bring up the IB fabric / subnet manager** — this is a provider
-   question, and the correct fix for the SOW's "NCCL over the inter-node
-   fabric" criterion.
-2. **Soft-RoCE (`rdma_rxe`) over `bond0`** — works today, no provider action,
-   but bandwidth is limited by the bonded Ethernet uplink.
-3. **Plain TCP NCCL over `bond0`** — always works, slowest.
+# optional bandwidth test (server first, then client)
+#   hgx01:  bash scripts/fabric-verify.sh server
+#   hgx20:  bash scripts/fabric-verify.sh client 10.100.18.5
+```
 
-`run-on-node.sh fabric` reports the current state so we can decide.
+Go/no-go for multi-node:
+- [ ] both `10.100.18.5` and `10.100.18.8` ping OK
+- [ ] all IB ports ACTIVE with LIDs
+- [ ] Lustre visible and writable on BOTH nodes (a `verify-<otherhost>-*`
+      file appearing proves it is genuinely shared)
