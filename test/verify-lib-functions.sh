@@ -6,7 +6,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 source "${HERE}/../scripts/lib.sh"
 
 rc=0
-for f in cluster_hosts_block cluster_hosts_current install_cluster_hosts verify_cluster_hosts show_cluster_hosts_sources; do
+for f in cluster_hosts_block cluster_hosts_current install_cluster_hosts verify_cluster_hosts show_cluster_hosts_sources flush_host_cache; do
   if declare -F "$f" >/dev/null 2>&1; then
     echo "  defined: $f"
   else

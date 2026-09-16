@@ -169,7 +169,30 @@ install_cluster_hosts() {
     } >> /etc/hosts
     changed="UPDATED"
   fi
+
+  # A caching resolver could keep answering with the pre-fix address, so the
+  # daemons would resolve the name to the old value despite the correct file.
+  if [[ "$changed" == "UPDATED" ]]; then
+    flush_host_cache
+  fi
   echo "$changed"
+}
+
+# Flush the host resolver cache.
+#
+# Slurm resolves SlurmctldHost=<name> via getaddrinfo, which goes through nss.
+# If a caching module (nscd, systemd-resolved with `resolve` in nsswitch, sssd)
+# is active, it can keep serving an answer cached BEFORE /etc/hosts was fixed -
+# so the daemon resolves the name to the old (loopback/stale) address even
+# though the file is correct, and the daemons talk to the wrong place. Restarting
+# the daemon does not help; the cache must be invalidated.
+flush_host_cache() {
+  if command -v nscd >/dev/null 2>&1 && systemctl is-active --quiet nscd 2>/dev/null; then
+    nscd -i hosts >/dev/null 2>&1 || true
+  fi
+  if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    resolvectl flush-caches >/dev/null 2>&1 || true
+  fi
 }
 
 # Assert every managed name resolves to its configured address on THIS node.
