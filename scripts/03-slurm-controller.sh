@@ -394,54 +394,44 @@ echo "    slurmdbd OK (accepting connections)"
 # 5. Detect hardware for NodeName lines
 #    slurmd -C prints the authoritative topology Slurm expects.
 # ---------------------------------------------------------------
-# Prefer the GRES string Slurm itself reports. `slurmd -C` emits a `Gres=`
-# field ONLY when it can actually talk to the GPU via NVML - which is the
-# exact thing slurmctld compares against. Guessing the type from nvidia-smi
-# risks a mismatch, and a mismatch DRAINs the node with
-# "gres/gpu count reported lower than configured".
-gpu_type_and_count() {   # echoes "<type> <count>"; EMPTY if not authoritative
-  local line name count
-  # 1. AUTHORITATIVE: slurmd's own NVML detection. slurmctld compares its
-  #    registration against this exact value, so using it guarantees a match.
-  line="$(slurmd -C 2>/dev/null | grep -m1 -o 'Gres=[^ ]*' || true)"
-  if [[ -n "$line" ]]; then
-    # Gres=gpu:type:N  or  Gres=gpu:N
-    echo "${line#Gres=}" | sed 's|^gpu:||' | awk -F: '{if (NF==2) print $1, $2; else print "gpu", $1}'
-    return 0
-  fi
-  # 2. EXPLICIT override only. We deliberately do NOT fall back to
-  #    nvidia-smi: if slurmd cannot see the GPU via NVML, configuring any
-  #    Gres= count makes slurmctld DRAIN the node with
-  #    "gres/gpu count reported lower than configured". Better to register
-  #    with no GRES and warn loudly than to silently break scheduling.
-  if [[ -n "${GPU_TYPE:-}" ]] && command -v nvidia-smi >/dev/null 2>&1; then
-    count="$(nvidia-smi --list-gpus 2>/dev/null | wc -l | tr -d ' ')"
-    [[ -n "$count" && "$count" != "0" ]] && { echo "${GPU_TYPE} ${count}"; return 0; }
-  fi
-  return 0   # caller treats empty as "no GRES configured"
-}
-
-detect_node() {  # $1 = hostname  -> echoes "NodeName=.. CPUs=.. RealMemory=.. [Gres=..]"
-  local host="$1" line cpus mem gres="" gtype="" gcount=""
-  line="$(slurmd -C 2>/dev/null | grep -m1 '^NodeName=' || true)"
-  if [[ -n "$line" ]]; then
-    cpus="$(sed -E 's/.*CPUs=([0-9]+).*/\1/' <<<"$line")"
-    mem="$(sed -E 's/.*RealMemory=([0-9]+).*/\1/' <<<"$line")"
-  else
-    cpus="$(nproc)"; mem="$(( $(awk '/MemTotal/{print $2}' /proc/meminfo) / 1024 ))"
-  fi
-  read -r gtype gcount <<<"$(gpu_type_and_count)"
-  if [[ -n "$gtype" && -n "$gcount" ]]; then
-    gres=" Gres=gpu:${gtype}:${gcount}"
-  fi
-  echo "NodeName=${host} CPUs=${cpus} RealMemory=${mem}${gres} State=UNKNOWN"
-}
+# Node description helper.
+# gpu_type_and_count() / detect_node() now live in lib.sh so 03 and 04 share
+# one definition; detect_node() can only describe the LOCAL machine, which
+# is why node 2's line is read from shared storage instead.
+# ---------------------------------------------------------------
 
 NODE_LINES="$(detect_node "$NODE1")"
 NODE_NAMES="$NODE1"
 if [[ -n "$NODE2_HOST" ]]; then
-  NODE_LINES="${NODE_LINES}
-$(detect_node "$NODE2_HOST")"
+  # Node 2's resources MUST come from node 2 itself: detect_node() reads the
+  # LOCAL kernel, so calling it with another host's name would stamp this
+  # machine's CPU/RAM/GPU counts onto that node's stanza and slurmd would be
+  # rejected on registration. 04 publishes what each node detected about
+  # itself; we read that. No ssh required - it is on shared storage.
+  node2_line="$(fetch_remote_node_line "$NODE2_HOST")"
+  if [[ -n "$node2_line" ]]; then
+    NODE_LINES="${NODE_LINES}
+${node2_line}"
+    echo "    ${NODE2_HOST} line read from shared storage:"
+    sed 's/^/      /' <<<"$node2_line"
+  else
+    # Refuse to invent it. Getting this wrong produces exactly the failure we
+    # saw: the node registers with different resources and slurmctld marks it
+    # INVALID_REG, or slurmd cannot find itself at all.
+    echo
+    echo "    !! ${NODE2_HOST} has not published its own node line yet."
+    echo "       ${cluster_stage_dir}/node-${NODE2_HOST}.conf is missing."
+    echo "       Run this FIRST, on ${NODE2_HOST}:"
+    echo "           sudo bash 04-slurm-compute.sh"
+    echo "       (04 publishes the node line before it starts slurmd, so it can"
+    echo "        run before the controller knows about it - no deadlock.)"
+    echo "       Then re-run here with NODE2_HOST=${NODE2_HOST}."
+    echo
+    echo "       Refusing to guess ${NODE2_HOST}'s CPU/memory/GPU counts:"
+    echo "       this machine's hardware is NOT ${NODE2_HOST}'s hardware."
+    echo
+    exit 1
+  fi
   NODE_NAMES="${NODE1},${NODE2_HOST}"
 else
   echo "    NODE2_HOST not set -> single-node config (re-run with NODE2_HOST=<name> when node 2 is up)"
@@ -689,15 +679,66 @@ chmod 600 /root/.slurm_db_pass
 echo
 echo "==> 03-slurm-controller.sh DONE"
 echo "    --- sinfo ---"
-sinfo -N -o "%N %T %C %G" 2>/dev/null || sinfo
+# `set -e` is on: `cmd || cmd` returns non-zero when BOTH fail, which aborts
+# the script even though the cluster came up fine. slurmctld needs a moment
+# after a restart, so a transient "Socket timed out" here is expected and must
+# NOT be treated as a failure. Everything below is reporting only.
+sinfo -N -o "%N %T %C %G" 2>/dev/null || sinfo 2>/dev/null || {
+  echo "    (sinfo not answering yet - slurmctld may still be starting;"
+  echo "     this is not fatal, re-run: sinfo -N -o '%N %T %C %G')"
+}
+echo
+# A node that is `inval` (INVALID_REG) registered with resources that differ
+# from slurm.conf, or a daemon is running stale state. The reason string is the
+# only thing that says WHICH, so always print it rather than leaving the user
+# with a bare `inval` and no next step.
+if sinfo -N -h -o "%N %T" 2>/dev/null | grep -qiE '\binval\b|\bdrain'; then
+  echo "    !! a node is not usable - details:"
+  for n in $(sinfo -N -h -o "%N %T" 2>/dev/null | awk 'tolower($2) ~ /inval|drain/ {print $1}'); do
+    echo "      --- ${n} ---"
+    echo "        slurmctld's view (configured):"
+    scontrol show node "$n" 2>/dev/null \
+      | grep -oE "(State|Reason|CPUTot|RealMemory|Gres)=[^ ]*" \
+      | sed 's/^ */          /'
+    echo "        configured in slurm.conf:"
+    grep -E "^NodeName=${n}(\s|$)" /etc/slurm/slurm.conf 2>/dev/null | sed 's/^ */          /'
+    # THE decisive check for the common GPU case: INVALID_REG is usually the
+    # node registering FEWER gres than configured. `slurmd -G` shows whether
+    # slurmd can see the driver at all - a login shell may see it while the
+    # systemd service cannot (different library path), which registers 0 GPUs.
+    if [[ "$n" == "$NODE1" ]]; then
+      echo "        this machine reports (slurmd -C):"
+      slurmd -C 2>/dev/null | grep -m1 '^NodeName=' | sed 's/^ */          /'
+      echo "        NVML visibility for slurmd (slurmd -G):"
+      slurmd -G 2>&1 | head -4 | sed 's/^ */          /'
+    fi
+  done
+  echo
+  echo "    Read the mismatch above - that is the cause. Most common:"
+  echo "      * registered Gres lower than configured (0 < N), and 'slurmd -G'"
+  echo "        reports the lib was not found -> the NVIDIA driver's"
+  echo "        libnvidia-ml.so.1 is not on the loader path FOR THE SERVICE."
+  echo "        Check on the node:  ldconfig; ls /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.*"
+  echo "        then restart it:    sudo systemctl restart slurmd"
+  echo "      * everything matches but the state is stale (the node registered"
+  echo "        before this config existed). Restart it, then on the controller:"
+  echo "          sudo scontrol update nodename=${n:-<node>} state=resume"
+fi
 echo
 echo "    Cluster artifacts published to: ${STAGE}"
 echo "    Next:"
-echo "      * on node 2 (NO ssh needed - it reads from shared storage):"
 if [[ -n "$NODE2_HOST" ]]; then
-  echo "          sudo bash 04-slurm-compute.sh"
+  echo "      * on ${NODE2_HOST}:  sudo bash 04-slurm-compute.sh"
+  echo "        (it will install the conf this run published, and start slurmd)"
 else
-  echo "          sudo bash 04-slurm-compute.sh"
-  echo "        then re-run here with NODE2_HOST=<node2> to add it to slurm.conf"
+  echo "      * node 2 is not in the config yet. The order is:"
+  echo "          1. on node 2:  sudo bash 04-slurm-compute.sh"
+  echo "             ^ publishes node 2's OWN CPU/RAM/GPU counts to"
+  echo "               ${STAGE}/node-<node2>.conf, then stops and asks you"
+  echo "               to come back here. Run it twice - that is expected."
+  echo "          2. here:       NODE2_HOST=<node2> sudo -E bash \$0"
+  echo "             ^ this reads that file (it cannot measure a remote"
+  echo "               node's hardware, and must not guess it)"
+  echo "          3. on node 2:  sudo bash 04-slurm-compute.sh   # now starts"
 fi
 echo "      * containers (both nodes):  sudo bash 05-pyxis-enroot.sh"

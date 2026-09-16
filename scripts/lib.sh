@@ -58,10 +58,24 @@ require_cmd() {
 
 # --- shared storage ---------------------------------------------------
 # 01-base.sh records SHARED_ROOT; default to Lustre when mounted.
+#
+# Precedence, highest first:
+#   1. SHARED_ROOT already set in the environment (an explicit override the
+#      caller passed, e.g. `SHARED_ROOT=/mnt/foo bash 04-...`). This MUST win -
+#      sourcing the file first would silently clobber it, which also makes the
+#      behaviour untestable.
+#   2. SHARED_ROOT from /etc/slurm-poc-shared.conf (written by 01-base.sh).
+#   3. Auto-detect: Lustre if mounted, else /shared.
 resolve_shared_root() {
-  if [[ -f /etc/slurm-poc-shared.conf ]]; then
+  local from_env="${SHARED_ROOT:-}"
+  if [[ -z "$from_env" && -f /etc/slurm-poc-shared.conf ]]; then
     # shellcheck disable=SC1091
     source /etc/slurm-poc-shared.conf
+  fi
+  # An explicitly provided value always wins over the file.
+  if [[ -n "$from_env" ]]; then
+    echo "$from_env"
+    return
   fi
   if [[ -z "${SHARED_ROOT:-}" ]]; then
     if mountpoint -q /mnt/i3d_20tb 2>/dev/null; then
@@ -231,4 +245,90 @@ show_cluster_hosts_sources() {
   done <<<"$block"
   echo "  --- nsswitch hosts order ---"
   grep '^hosts:' /etc/nsswitch.conf 2>/dev/null | sed 's/^/    /'
+}
+
+# --- cluster config staging -------------------------------------------
+# The controller publishes munge.key + slurm.conf here; compute nodes read
+# them, so node 2 needs NO ssh access to node 1.
+cluster_stage_dir() {
+  local root
+  root="$(resolve_shared_root)"
+  echo "${root}/cluster-config"
+}
+
+# --- Slurm node description -------------------------------------------
+# The single source of truth for a `NodeName=` line, used by 03 (both nodes)
+# and by 04 (to check it is describing ITSELF, not another host).
+
+# "<type> <count>", or EMPTY when nothing is authoritative.
+gpu_type_and_count() {
+  local line name count
+  # 1. AUTHORITATIVE: slurmd's own NVML detection. slurmctld compares the
+  #    registration against this exact value, so using it guarantees a match.
+  line="$(slurmd -C 2>/dev/null | grep -m1 -o 'Gres=[^ ]*' || true)"
+  if [[ -n "$line" ]]; then
+    # Gres=gpu:type:N  or  Gres=gpu:N
+    echo "${line#Gres=}" | sed 's|^gpu:||' \
+      | awk -F: '{if (NF==2) print $1, $2; else print "gpu", $1}'
+    return 0
+  fi
+  # 2. EXPLICIT override only. We deliberately do NOT fall back to
+  #    nvidia-smi: if slurmd cannot see the GPU via NVML, configuring any
+  #    Gres= count makes slurmctld DRAIN the node with
+  #    "gres/gpu count reported lower than configured". Better to register
+  #    with no GRES and warn loudly than to silently break scheduling.
+  if [[ -n "${GPU_TYPE:-}" ]] && command -v nvidia-smi >/dev/null 2>&1; then
+    count="$(nvidia-smi --list-gpus 2>/dev/null | wc -l | tr -d ' ')"
+    [[ -n "$count" && "$count" != "0" ]] && { echo "${GPU_TYPE} ${count}"; return 0; }
+  fi
+  return 0   # caller treats empty as "no GRES configured"
+}
+
+# Detect THIS machine's resources and print a NodeName= line for $1.
+#
+# IMPORTANT: this can only ever describe the LOCAL machine (CPU count, memory,
+# GPU count come from the running kernel). It must therefore only be asked
+# about the host we are running on. Labelling another host's name with local
+# hardware produces a config slurmd rejects on registration. Use
+# fetch_remote_node_line() to obtain another node's own line.
+detect_node() {   # $1 = hostname this machine IS
+  local host="$1" line cpus mem gres="" gtype="" gcount=""
+  line="$(slurmd -C 2>/dev/null | grep -m1 '^NodeName=' || true)"
+  if [[ -n "$line" ]]; then
+    cpus="$(sed -E 's/.*CPUs=([0-9]+).*/\1/' <<<"$line")"
+    mem="$(sed -E 's/.*RealMemory=([0-9]+).*/\1/' <<<"$line")"
+  else
+    cpus="$(nproc)"; mem="$(( $(awk '/MemTotal/{print $2}' /proc/meminfo) / 1024 ))"
+  fi
+  read -r gtype gcount <<<"$(gpu_type_and_count)"
+  if [[ -n "$gtype" && -n "$gcount" ]]; then
+    gres=" Gres=gpu:${gtype}:${gcount}"
+  fi
+  echo "NodeName=${host} CPUs=${cpus} RealMemory=${mem}${gres} State=UNKNOWN"
+}
+
+# Read node $1's own NodeName line from shared storage, where 04 publishes
+# what the node detected about itself. Falls back to nothing (caller decides).
+fetch_remote_node_line() {   # $1 = hostname
+  local host="$1" f
+  f="$(cluster_stage_dir)/node-${host}.conf"
+  if [[ -s "$f" ]]; then
+    grep -m1 '^NodeName=' "$f" 2>/dev/null || true
+  fi
+}
+
+# Write THIS node's own NodeName line to shared storage so the controller can
+# build a correct multi-node slurm.conf without ssh. Prelude to the config
+# that has to be published. Also keeps a copy of the resources we detected.
+publish_own_node_line() {    # $1 = hostname (defaults to local short name)
+  local host="${1:-$(hostname -s)}"
+  local stage line
+  stage="$(cluster_stage_dir)"
+  mkdir -p "$stage" 2>/dev/null || { echo "!! cannot write ${stage}" >&2; return 1; }
+  line="$(detect_node "$host")"
+  # Written under a temp name then moved, so the controller never reads a
+  # half-written file.
+  printf '%s\n' "$line" > "${stage}/.node-${host}.tmp" 2>/dev/null \
+    && mv "${stage}/.node-${host}.tmp" "${stage}/node-${host}.conf"
+  echo "$line"
 }

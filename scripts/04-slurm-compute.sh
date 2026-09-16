@@ -144,8 +144,45 @@ echo "    munge OK  (md5: $(md5sum < /etc/munge/munge.key | cut -c1-16))"
 # 2. slurm.conf - must be byte-identical to the controller's
 # ---------------------------------------------------------------
 mkdir -p /etc/slurm /var/spool/slurmd /var/log/slurm
+
+# Publish what THIS node detects about itself, BEFORE slurmd is started.
+# The controller reads this file to build a correct multi-node slurm.conf -
+# it cannot derive our CPU/RAM/GPU counts remotely, and guessing them makes
+# slurmd fail registration. Doing it here (rather than after the controller
+# has been configured) is what removes the ordering deadlock: this node
+# announces itself first, then the controller adds it.
+SELF_HOST="$(hostname -s)"
+if own_line="$(publish_own_node_line "$SELF_HOST" 2>&1)"; then
+  echo "    published own node line -> $(cluster_stage_dir)/node-${SELF_HOST}.conf"
+  sed 's/^/      /' <<<"$own_line"
+else
+  echo "    !! could not publish ${SELF_HOST}'s node line to shared storage:"
+  echo "       ${own_line}"
+  echo "       The controller needs it to add this node to slurm.conf."
+  echo "       Check that ${SHARED_ROOT} is writable, then re-run."
+fi
+
 if [[ -f "${STAGE}/slurm.conf" ]]; then
   echo "    taking slurm.conf from shared storage"
+  # Verify this node is actually described in it. Installing a config that
+  # does not mention us makes slurmd die with the unhelpful
+  #   fatal: Unable to determine this slurmd's NodeName
+  # so check first and say exactly what to do instead. Anchored on the
+  # `NodeName=` key so a longer name (e.g. hgx201 vs hgx20) cannot match.
+  if ! grep -qE "^NodeName=${SELF_HOST}([[:space:]]|$)" "${STAGE}/slurm.conf"; then
+    echo
+    echo "    !! the controller's slurm.conf does not mention ${SELF_HOST}."
+    echo "       Installing it would make slurmd fail with:"
+    echo "         fatal: Unable to determine this slurmd's NodeName"
+    echo
+    echo "       This node has now published its own line, so on the"
+    echo "       controller run:"
+    echo "           NODE2_HOST=${SELF_HOST} sudo -E bash 03-slurm-controller.sh"
+    echo "       and then re-run this script."
+    echo
+    echo "       (Not starting slurmd with a config that cannot work.)"
+    exit 1
+  fi
   install -m 644 "${STAGE}/slurm.conf" /etc/slurm/slurm.conf
 else
   echo "    !! ${STAGE}/slurm.conf missing - run 03 on ${CTRL_HOST} first"

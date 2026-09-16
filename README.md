@@ -70,28 +70,41 @@ So the operator runs the scripts and pastes the logs back.
 Scripts auto-detect hostname, CPU, RAM and GPU type. Node 2 is optional until
 it is up.
 
+**The order matters and is not symmetric.** Node 2 announces itself *before*
+the controller is told about it — that removed a deadlock where the controller
+needed node 2's hardware (which only node 2 can measure) while node 2 waited
+for a `slurm.conf` that mentioned it.
+
 ```bash
 # --- on hgx01 (10.100.18.5) ---
 cd ~/hengjiantmp/i3d-slurm-poc
 bash scripts/run-on-node.sh preflight        # already done ✅
 bash scripts/run-on-node.sh fabric           # check IB / shared FS
 sudo bash scripts/01-base.sh                 # writes /etc/hosts, sysctls, sshd
-sudo bash scripts/03-slurm-controller.sh     # single node to start
+sudo bash scripts/03-slurm-controller.sh     # controller, single node to start
 
 # --- on hgx20 (10.100.18.8) ---
 cd ~/hengjiantmp/i3d-slurm-poc
 sudo bash scripts/01-base.sh
-CTRL_HOST=hgx01 sudo -E bash scripts/04-slurm-compute.sh
-sudo scp hgx01:/etc/munge/munge.key /etc/munge/   # if 04 could not fetch it
+sudo bash scripts/04-slurm-compute.sh
+#   04 publishes hgx20's OWN NodeName line to /mnt/i3d_20tb/slurm-poc/
+#   cluster-config/node-hgx20.conf (CPU/RAM/GPU counts only hgx20 can
+#   measure) and then refuses to start slurmd until the controller's
+#   slurm.conf mentions hgx20. Running it twice is expected and safe:
+#   first run publishes + tells you to configure the controller.
 
-# include node2 in the controller config (re-run on hgx01)
+# --- back on hgx01: add node 2 using ITS OWN published line ---
 NODE2_HOST=hgx20 sudo -E bash scripts/03-slurm-controller.sh
+
+# --- back on hgx20: now the conf mentions it ---
+sudo bash scripts/04-slurm-compute.sh
 
 # --- on BOTH nodes: containers / sqsh ---
 sudo bash scripts/05-pyxis-enroot.sh
 
 # --- on BOTH nodes (after 01-base.sh) ---
-sudo bash test/verify-hosts-resolution.sh    # 9 assertions; MUST be all-PASS
+sudo bash test/verify-hosts-resolution.sh    # 11 assertions; MUST be all-PASS
+
 
 # --- verify (hgx01) ---
 sinfo -N -o "%N %T %C %G"
@@ -184,12 +197,18 @@ four further defects it hid — all reproduced in a real cluster, all fixed:
 | 7 | `SlurmctldHost=<name>(<addr>)` pinned an address | replies came from a different address than clients used → `Socket timed out on send/recv operation` | use the bare hostname; let `/etc/hosts` resolve it on every node |
 | 8 | `systemctl enable --now slurmd/slurmctld` on a re-run | daemon kept the **previous** `slurm.conf` → `Node X appears to have a different slurm.conf than the slurmctld`, node stuck `inval` | `enable` + `restart`, so both daemons parse the same file |
 | 9 | state dir cleared partially (left `clustername`, dropped `assoc_usage`) | `fatal: No Assoc usage file (/var/spool/slurmctld/assoc_usage) to recover` | delete the **whole** dir, then verify it is empty |
+| 10 | `detect_node "$NODE2_HOST"` ran `slurmd -C` **locally** | node 2's stanza carried node 1's CPU/RAM/GPU counts → `inval` (INVALID_REG) or failed registration | node 2 publishes its own line to shared storage; the controller **reads** it and refuses to guess |
+| 11 | documented order was a deadlock | 03 wrote a conf without node 2; 04 installed it verbatim → `fatal: Unable to determine this slurmd's NodeName`; only *then* did the docs say to add node 2 | 04 publishes its node line and stops; then 03 adds node 2; then 04 starts slurmd. Order documented as asymmetric + idempotent |
+| 12 | `sinfo ... \|\| sinfo` as the last command under `set -e` | both fail while slurmctld restarts → **03 exits 1 despite succeeding** | report-only, never fatal; `sinfo` retried with a hint |
+| 13 | `resolve_shared_root` sourced the conf file over `SHARED_ROOT` | an explicit `SHARED_ROOT=` override was silently ignored (and untestable) | environment wins over the file |
 
-Bugs 6-9 are the multi-node blockers: with the full stack installed, `hgx01`
+Bugs 6-13 are the multi-node blockers: with the full stack installed, `hgx01`
 showed the node as `inval` and `hgx20` could not reach the controller at all.
-All are fixed and locked down by `test/verify-hosts-resolution.sh` (9
-assertions) and `test/verify-end-to-end.sh` (clean run → node `idle` →
-submitted job `COMPLETED` → `sacct` reports it).
+All are fixed and locked down by `test/verify-hosts-resolution.sh` (11
+assertions), `test/verify-multinode-bootstrap.sh` (11),
+`test/verify-two-node-flow.sh` and `test/verify-03-node2.sh` (refuses to
+invent, then succeeds), plus `test/verify-end-to-end.sh` (clean run → node
+`idle` → submitted job `COMPLETED` → `sacct` reports it).
 
 > **On the real nodes, run `01-base.sh` on BOTH first.** It must print
 > `hostname resolution OK (<node> sees both nodes)`; if it prints
