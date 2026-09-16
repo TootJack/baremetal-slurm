@@ -614,6 +614,20 @@ if [[ -d /var/spool/slurmctld ]]; then
     RESET_STATE=1
     echo "    !! state dir holds cluster '${OLD_NAME}' (id ${OLD_ID}), want '${CLUSTER_NAME}'"
     echo "       clearing it so slurmctld can start"
+  elif [[ -n "$OLD_CLUSTER" && ! -f /var/spool/slurmctld/assoc_usage ]]; then
+    # INCONSISTENT state dir. Slurm writes cluster state together, and on
+    # startup requires assoc_usage whenever clustername exists:
+    #   assoc_mgr.c: if (clustername_existed && !ignore_state_errors)
+    #                    fatal("No Assoc usage file (%s) to recover", ...)
+    # A dir holding clustername WITHOUT assoc_usage therefore kills slurmctld
+    # in a restart loop - and it never recovers on its own, because the
+    # cluster name matches so nothing looks wrong. Triggered by an interrupted
+    # wipe or a crash mid-write.
+    RESET_STATE=1
+    echo "    !! state dir is INCONSISTENT: has clustername (${OLD_CLUSTER})"
+    echo "       but no assoc_usage. slurmctld would die with:"
+    echo "         fatal: No Assoc usage file ... to recover"
+    echo "       clearing it so slurmctld can start"
   fi
   if [[ "$RESET_STATE" == "1" ]]; then
     mv /var/spool/slurmctld "/var/spool/slurmctld.bak.$(date +%s)" 2>/dev/null \
@@ -693,7 +707,40 @@ echo "    slurmctld OK"
 # start slurmd on this node too (node1 also computes)
 systemctl enable slurmd 2>/dev/null || true
 systemctl restart slurmd 2>/dev/null || true
-sleep 3
+sleep 5   # give every node a moment to re-register with the new config
+
+# ---------------------------------------------------------------
+# 8b. Clear drains left over from an earlier FAILED registration.
+#
+# Slurm sets INVALID_REG + DRAIN when a node registers with resources that do
+# not match slurm.conf (e.g. the GRES socket-boundary error this script used to
+# produce). ReturnToService does NOT clear that - node_mgr.c only returns a
+# node to service when
+#     IS_NODE_DOWN() && !IS_NODE_INVALID_REG() && ret2service == 2
+# so INVALID_REG is explicitly excluded and an admin must resume it. Without
+# this step a config fix appears to do nothing: the node stays `drained`
+# forever carrying a stale Reason. That is exactly what happened on hgx01/hgx20
+# after the topology fix - correct GRES, but still drained.
+#
+# Only nodes that have ALREADY re-registered cleanly are resumed. A node still
+# failing validation is left drained so the real problem stays visible.
+# ---------------------------------------------------------------
+if command -v scontrol >/dev/null 2>&1; then
+  for n in $(sinfo -N -h -o "%N %T" 2>/dev/null \
+             | awk 'tolower($2) ~ /drain/ {print $1}' | sort -u); do
+    st="$(scontrol show node "$n" 2>/dev/null | grep -oE 'State=[A-Z_+]+' | head -1)"
+    if grep -q "INVALID_REG" <<<"$st" || grep -q "NO_RESPOND" <<<"$st"; then
+      echo "    ${n} still ${st#State=} - leaving drained (failing validation)"
+    else
+      reason="$(scontrol show node "$n" 2>/dev/null \
+                | grep -oE 'Reason=[^[]*' | head -1 | sed 's/^Reason=//')"
+      echo "    ${n} registered cleanly but is drained; resuming"
+      echo "      stale reason was: ${reason:-<none>}"
+      timeout 15 scontrol update nodename="$n" state=resume >/dev/null 2>&1 \
+        && echo "      resumed" || echo "      !! could not resume ${n}"
+    fi
+  done
+fi
 
 cat > /root/.slurm_db_pass <<EOF
 DB_PASS=${DB_PASS}
