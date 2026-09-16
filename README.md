@@ -91,7 +91,7 @@ NODE2_HOST=hgx20 sudo -E bash scripts/03-slurm-controller.sh
 sudo bash scripts/05-pyxis-enroot.sh
 
 # --- on BOTH nodes (after 01-base.sh) ---
-sudo bash test/verify-hosts-resolution.sh    # 5 assertions; MUST be all-PASS
+sudo bash test/verify-hosts-resolution.sh    # 9 assertions; MUST be all-PASS
 
 # --- verify (hgx01) ---
 sinfo -N -o "%N %T %C %G"
@@ -187,13 +187,25 @@ four further defects it hid — all reproduced in a real cluster, all fixed:
 
 Bugs 6-9 are the multi-node blockers: with the full stack installed, `hgx01`
 showed the node as `inval` and `hgx20` could not reach the controller at all.
-All four are fixed and locked down by `test/verify-hosts-resolution.sh` (5
+All are fixed and locked down by `test/verify-hosts-resolution.sh` (9
 assertions) and `test/verify-end-to-end.sh` (clean run → node `idle` →
 submitted job `COMPLETED` → `sacct` reports it).
 
 > **On the real nodes, run `01-base.sh` on BOTH first.** It must print
 > `hostname resolution OK (<node> sees both nodes)`; if it prints
 > `!! ... resolves to '127.0.1.1'` then Slurm will never reach the controller.
+
+> **If a name resolves to the wrong address**, the cause is usually a stray or
+> duplicate `/etc/hosts` line outside the managed block. nsswitch is
+> `files dns`, and within `files` the **first** match wins — so such a line
+> silently beats the block and still resolves "successfully", just wrongly.
+> `01-base.sh` now removes those, printing
+> `removing stray/duplicate mapping(s) for <name>`. To see the sources:
+
+```bash
+# every /etc/hosts line mentioning the cluster names + what each resolves to
+sudo bash -c 'source scripts/lib.sh && show_cluster_hosts_sources'
+```
 
 Also fixed: `sacctmgr` calls are all `timeout`-wrapped (they could block),
 `01-base.sh` now repairs half-configured dpkg before `apt-get install`
