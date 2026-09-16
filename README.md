@@ -193,3 +193,56 @@ H200 nodes, confirm before trusting the output:
 slurmd -G          # must NOT say "lib wasn't found"
 slurmd -C          # must include Gres=gpu:nvidia_h200:8
 ```
+
+## SLURM_MODE=source — Slurm 25.11.8 from source (chosen)
+
+`03`/`04` now accept `SLURM_MODE` (default `source`). It builds Slurm
+**25.11.8** to `/opt/slurm` on both nodes via `scripts/slurm-source.sh`.
+
+```bash
+# controller (hgx01) - first run also drops the stale accounting DB
+RESET_ACCT_DB=1 sudo -E SLURM_MODE=source bash scripts/03-slurm-controller.sh
+# compute (hgx20)
+sudo -E SLURM_MODE=source bash scripts/04-slurm-compute.sh
+# containers, both nodes
+sudo bash scripts/05-pyxis-enroot.sh
+```
+
+### Why source (and not the vendor/distro stack)
+
+| | Version | Problem |
+|---|---|---|
+| Vendor (`slurm23.02-client ... cm10.0`) | 23.02 | Lacks SOW features; my first attempt *replaced* it |
+| Ubuntu `slurm-wlm` | **21.08.5** | Too old; `HAVE_NVML` undefined → GRES silently broken |
+| **Source build** | **25.11.8** | `HAVE_NVML 1` verified; matches the SOW/Slinky target |
+
+### Build facts (measured)
+
+- **~87 s** to compile on 20 cores; download is 6.5 MB.
+- Requires `pkg-config`, `libpmix-dev`, `libjson-c-dev`, `libhdf5-dev`,
+  `libmariadb-dev`, and **`libnvidia-ml-dev`** (provides `nvml.h`).
+- **Without `libnvidia-ml-dev`, `HAVE_NVML` is UNDEFINED** and GPU GRES
+  silently fails — `slurm-source.sh` verifies and refuses to install.
+
+### Problems found and fixed by running it
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `HAVE_NVML` undefined | `nvml.h` missing | install `libnvidia-ml-dev`, verify the define |
+| `Exception caught: rsmi_init` | distro `rocm_smi` autodetected, no AMD GPU | `--without-rsmi` |
+| `sacctmgr: fetch_config: DNS SRV lookup failed` (20 s hang) | `/etc/slurm/slurm.conf` written **after** the dbd probe | seed a minimal config before probing |
+| `fatal: Database schema is too old` | DB created by Slurm 21.08/23.11 | `RESET_ACCT_DB=1` (drops history); verified a fresh DB starts fine |
+| `slurmdbd` "Deactivated successfully" with no error | no `PidFile`; `Type=forking` lost the daemon | `Type=simple` + `-D` |
+| `fatal: /sys/fs/cgroup is not a valid cgroup2 mountpoint` | forced `cgroup/v2` when only hybrid cgroups exist | detect with `stat -fc %T`, fall back to `cgroup/v1` |
+| **`slurmd initialization failed`** | Pyxis built against 23.11: *"Incompatible Slurm plugin version (23.11.4)"* | rebuild Pyxis when the Slurm version changes, stamp `.built-against` |
+
+### Verified end state (test cluster)
+
+```
+slurmctld 25.11.8  /  slurmd 25.11.8  /  slurmdbd 25.11.8
+sinfo: node = idle
+daemons: munge, mariadb, slurmdbd, slurmctld, slurmd all active
+```
+
+Note Pyxis builds against the version of Slurm that will load it — a mismatch
+makes `slurmd` **refuse to start entirely**, not merely skip the plugin.

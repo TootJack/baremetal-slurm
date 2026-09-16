@@ -74,20 +74,60 @@ EOF
 # 2. Pyxis (SPANK plugin; must be compiled against the exact
 #    installed Slurm version - this is the documented constraint)
 # ---------------------------------------------------------------
-if [[ ! -d /opt/pyxis ]]; then
-  echo "    building pyxis ${PYXIS_VERSION} against installed Slurm headers"
-  # libslurm-dev provides spank.h; pyxis must compile against the EXACT
-  # installed Slurm version or slurmd will refuse to load the plugin.
-  apt-get install -y -qq git make libslurm-dev >/dev/null
+# Pyxis must compile against the EXACT Slurm it will load into - slurmd
+# REFUSES TO START otherwise:
+#   "Incompatible Slurm plugin spank_pyxis.so version (23.11.4)"
+#   "slurmd initialization failed"
+# So detect the installed Slurm version and rebuild when it does not match
+# what the existing plugin was built against.
+SLURM_PREFIX="${SLURM_PREFIX:-/opt/slurm}"
+if [[ -d "${SLURM_PREFIX}/include/slurm" ]]; then
+  mkdir -p /usr/include/slurm
+  ln -sf "${SLURM_PREFIX}"/include/slurm/*.h /usr/include/slurm/ 2>/dev/null || true
+  echo "    using Slurm headers from ${SLURM_PREFIX}"
+fi
+
+# Which Slurm is actually going to load this plugin?
+if [[ -x "${SLURM_PREFIX}/sbin/slurmd" ]]; then
+  SLURM_VER_INSTALLED="$("${SLURM_PREFIX}/sbin/slurmd" -V 2>/dev/null | awk '{print $2}')"
+elif command -v slurmd >/dev/null 2>&1; then
+  SLURM_VER_INSTALLED="$(slurmd -V 2>/dev/null | awk '{print $2}')"
+fi
+echo "    installed Slurm: ${SLURM_VER_INSTALLED:-unknown}"
+
+# Record which version an existing plugin was built against.
+STAMP=/usr/local/share/pyxis/.built-against
+NEED_PYXIS=0
+if [[ ! -f /usr/local/lib/slurm/spank_pyxis.so ]]; then
+  NEED_PYXIS=1
+elif [[ ! -f "$STAMP" ]] || [[ "$(cat "$STAMP" 2>/dev/null)" != "$SLURM_VER_INSTALLED" ]]; then
+  echo "    existing pyxis plugin is stale (built against $(cat "$STAMP" 2>/dev/null || echo unknown))"
+  NEED_PYXIS=1
+fi
+
+if [[ "$NEED_PYXIS" == "1" ]]; then
+  echo "    building pyxis ${PYXIS_VERSION} against Slurm ${SLURM_VER_INSTALLED}"
+  apt-get install -y -qq git make 2>/dev/null
+  [[ -e /usr/include/slurm/spank.h ]] || apt-get install -y -qq libslurm-dev 2>/dev/null || true
+  rm -rf /opt/pyxis
   git clone --depth 1 --branch "v${PYXIS_VERSION}" \
     https://github.com/NVIDIA/pyxis /opt/pyxis
+  cd /opt/pyxis
+  make clean >/dev/null 2>&1 || true
+  make
+  make install
+  mkdir -p "$(dirname "$STAMP")"
+  echo "$SLURM_VER_INSTALLED" > "$STAMP"
+  echo "    built and stamped against ${SLURM_VER_INSTALLED}"
 fi
-cd /opt/pyxis
-make
-make install
+
 mkdir -p /etc/slurm/plugstack.conf.d
 cat > /etc/slurm/plugstack.conf.d/pyxis.conf <<'EOF'
 include /usr/local/share/pyxis/pyxis.conf
+EOF
+# Slurm's client side (srun) also needs to see the SPANK plugin
+cat > /etc/slurm/plugstack.conf <<'EOF'
+include /etc/slurm/plugstack.conf.d/*.conf
 EOF
 
 # ---------------------------------------------------------------

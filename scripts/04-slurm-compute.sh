@@ -26,8 +26,31 @@ echo "==> Slurm compute node setup on $(hostname -s)"
 echo "    controller: ${CTRL_HOST}"
 
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq slurmd slurm-client munge
+
+# SLURM_MODE must match the controller's choice. 'source' builds the same
+# 25.11 to /opt/slurm so both nodes run an identical version (required by
+# Slurm, and Pyxis must compile against the same headers).
+SLURM_MODE="${SLURM_MODE:-source}"
+if [[ "$SLURM_MODE" == "source" ]]; then
+  echo "    SLURM_MODE=source -> building Slurm ${SLURM_VER:-25.11.8} at ${PREFIX:-/opt/slurm}"
+  if [[ ! -x "${PREFIX:-/opt/slurm}/sbin/slurmd" ]]; then
+    SLURM_MODE=source bash "$(dirname "$0")/slurm-source.sh"
+  else
+    echo "    already installed at ${PREFIX:-/opt/slurm}"
+    [[ -f /etc/profile.d/slurm.sh ]] || SLURM_MODE=source bash "$(dirname "$0")/slurm-source.sh"
+  fi
+  if [[ -n "$(dpkg -l 2>/dev/null | awk '/^ii/ && $2 ~ /^slurm[0-9]/ {print $2}')" ]]; then
+    echo "    removing vendor Slurm packages"
+    for p in $(dpkg -l 2>/dev/null | awk '/^ii/ && $2 ~ /^slurm[0-9]/ {print $2}'); do
+      apt-get remove -y -qq "$p" 2>&1 | tail -1 || true
+    done
+  fi
+  apt-get install -y -qq munge libmunge-dev 2>&1 | tail -2
+  export PATH="${PREFIX:-/opt/slurm}/bin:${PREFIX:-/opt/slurm}/sbin:$PATH"
+else
+  apt-get update -qq
+  apt-get install -y -qq slurmd slurm-client munge 2>&1 | tail -3
+fi
 
 # ---------------------------------------------------------------
 # Resolve shared storage (Lustre). 01-base.sh wrote this on both nodes.

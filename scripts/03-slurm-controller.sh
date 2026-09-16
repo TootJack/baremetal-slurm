@@ -74,26 +74,69 @@ echo "    controller: ${NODE1} $(hostname -I 2>/dev/null | awk '{print $1}')"
 # ---------------------------------------------------------------
 export DEBIAN_FRONTEND=noninteractive
 VENDOR_SLURM="$(dpkg -l 2>/dev/null | awk '/^ii/ && $2 ~ /^slurm[0-9]/ {print $2" "$3}' | head -5)"
+
+# SLURM_MODE decides how we get Slurm. Default is 'source' (25.11) because
+# these nodes ship a vendor 23.02 stack that lacks SOW features, and the
+# distro package is only 21.08.
+SLURM_MODE="${SLURM_MODE:-source}"
+
 if [[ -n "$VENDOR_SLURM" ]]; then
-  echo "    !! A vendor Slurm stack is already installed:"
+  echo "    vendor Slurm present:"
   sed 's/^/       /' <<<"$VENDOR_SLURM"
-  echo
-  echo "    Installing Ubuntu's slurm-wlm would REPLACE it (and downgrade"
-  echo "    to 21.08). Choose one and re-run with the matching mode:"
-  echo
-  echo "      SLURM_MODE=vendor   keep/configure the existing vendor stack"
-  echo "                          (packages untouched; only slurm.conf + dbd)"
-  echo "      SLURM_MODE=distro   install Ubuntu slurm-wlm (replaces vendor)"
-  echo "      SLURM_MODE=source   build Slurm 25.11 from source (PMC/SOW"
-  echo "                          target, needs build deps + ~10 min)"
-  echo
-  echo "    Refusing to guess. Set SLURM_MODE and re-run."
-  exit 1
 fi
 
-apt-get update -qq
-apt-get install -y -qq slurm-wlm slurmdbd munge mariadb-server \
-  libmunge-dev libmariadb-dev 2>&1 | tail -3
+case "$SLURM_MODE" in
+  source)
+    echo "    SLURM_MODE=source -> building Slurm from source at ${PREFIX:-/opt/slurm}"
+    # Run slurm-source.sh when Slurm is missing OR when the systemd units /
+    # PATH wiring are missing (e.g. units deleted, or a fresh shell after a
+    # reboot). It is idempotent: it skips the compile if the version matches.
+    NEED_BUILD=0
+    if [[ ! -x "${PREFIX:-/opt/slurm}/sbin/slurmctld" ]]; then
+      NEED_BUILD=1
+    elif ! "${PREFIX:-/opt/slurm}/sbin/slurmctld" -V 2>/dev/null | grep -q "${SLURM_VER:-25.11}"; then
+      NEED_BUILD=1
+    elif [[ ! -f /etc/systemd/system/slurmctld.service ]] \
+      || [[ ! -f /etc/systemd/system/slurmd.service ]] \
+      || [[ ! -f /etc/systemd/system/slurmdbd.service ]] \
+      || [[ ! -f /etc/profile.d/slurm.sh ]]; then
+      echo "    Slurm present but systemd units/PATH missing -> regenerating"
+      NEED_BUILD=1
+    fi
+    if [[ "$NEED_BUILD" == "1" ]]; then
+      SLURM_MODE=source bash "$(dirname "$0")/slurm-source.sh"
+    else
+      echo "    Slurm ${SLURM_VER:-25.11} already installed and wired at ${PREFIX:-/opt/slurm}"
+    fi
+    # Remove the vendor packages so they cannot conflict with /opt/slurm
+    # on PATH or in ld.so.
+    if [[ -n "$VENDOR_SLURM" ]]; then
+      echo "    removing vendor Slurm packages (they would shadow /opt/slurm)"
+      for p in $(awk '{print $1}' <<<"$VENDOR_SLURM"); do
+        apt-get remove -y -qq "$p" 2>&1 | tail -1 || true
+      done
+    fi
+    # munge + mariadb come from distro packages; the rest of the stack is ours
+    apt-get install -y -qq munge mariadb-server libmunge-dev libmariadb-dev 2>&1 | tail -2
+    # ensure our binaries win in this shell
+    export PATH="${PREFIX:-/opt/slurm}/bin:${PREFIX:-/opt/slurm}/sbin:$PATH"
+    ;;
+  distro)
+    echo "    SLURM_MODE=distro -> Ubuntu slurm-wlm (replaces any vendor stack)"
+    apt-get update -qq
+    apt-get install -y -qq slurm-wlm slurmdbd munge mariadb-server \
+      libmunge-dev libmariadb-dev 2>&1 | tail -3
+    ;;
+  vendor)
+    echo "    SLURM_MODE=vendor -> keeping the existing vendor stack"
+    echo "    !! not implemented for this POC; use source or distro"
+    exit 1
+    ;;
+  *)
+    echo "!! unknown SLURM_MODE='${SLURM_MODE}' (use source|distro)"
+    exit 1
+    ;;
+esac
 
 # ---------------------------------------------------------------
 # 2. Munge
@@ -171,25 +214,96 @@ StorageHost=127.0.0.1
 StorageLoc=slurm_acct_db
 StorageUser=slurm
 StoragePass=${DB_PASS}
+# REQUIRED with the source build's systemd unit: Type=forking tracks the
+# daemon via this pid file. Without it systemd sees the parent exit and
+# marks the service "inactive (dead)" even though slurmdbd is running.
+PidFile=/run/slurmdbd.pid
 EOF
+# slurmdbd refuses to start unless this file is 0600
 chmod 600 /etc/slurm/slurmdbd.conf
+chown root:root /etc/slurm/slurmdbd.conf
+
+# Slurm 25.11 refuses to start when the accounting DB was created by a much
+# older version. Verified root cause by reading as_mysql_convert.c:172-175:
+# it fatals if `cluster_table` EXISTS but the schema version is below
+# MIN_CONVERT_VERSION. A genuinely EMPTY database starts fine and 25.11
+# creates its own tables (verified: 12 tables created).
+# So: drop the DB BEFORE restarting, rather than reading stale journal lines
+# (an earlier attempt grep'd the journal and matched old boot entries).
+if [[ "${RESET_ACCT_DB:-0}" == "1" ]]; then
+  echo "    RESET_ACCT_DB=1 -> recreating slurm_acct_db from scratch"
+  systemctl stop slurmdbd 2>/dev/null || true
+  mysql -e "DROP DATABASE IF EXISTS slurm_acct_db;"
+  mysql -e "CREATE DATABASE slurm_acct_db;"
+  mysql -e "GRANT ALL ON slurm_acct_db.* TO 'slurm'@'localhost'; FLUSH PRIVILEGES;"
+fi
+
 systemctl enable slurmdbd >/dev/null 2>&1 || true
-# restart (not just start): on a re-run the daemon may be holding the old
-# config/password, which produced "Access denied" against the new one.
+systemctl reset-failed slurmdbd 2>/dev/null || true
+
+# IMPORTANT ORDERING: sacctmgr (and every Slurm client) needs
+# /etc/slurm/slurm.conf merely to LOCATE slurmdbd. Without it we get:
+#   sacctmgr: error: resolve_ctls_from_dns_srv: Host name lookup failure
+#   sacctmgr: fatal: Could not establish a configuration source
+# which also blocks ~20s on a DNS SRV lookup and killed this script under
+# `set -e`. The full config is written in section 6, but that happens AFTER
+# the DB registration step - so seed a minimal config here.
+mkdir -p /etc/slurm
+if [[ ! -s /etc/slurm/slurm.conf ]]; then
+  cat > /etc/slurm/slurm.conf <<EOF
+# Minimal config so clients can find slurmdbd. section 6 overwrites this.
+ClusterName=${CLUSTER_NAME}
+SlurmctldHost=${NODE1}
+AuthType=auth/munge
+AccountingStorageType=accounting_storage/slurmdbd
+AccountingStorageHost=127.0.0.1
+AccountingStoragePort=6819
+EOF
+  echo "    seeded minimal /etc/slurm/slurm.conf (clients need it to find slurmdbd)"
+fi
+# timestamp boundary so we only judge THIS attempt, never an older boot's
+# "fatal" line (journalctl -n N happily returns entries from previous boots)
+DBD_SINCE="$(date '+%Y-%m-%d %H:%M:%S')"
 systemctl restart slurmdbd
+sleep 3
+
+# give it a moment to either come up or die
+for _ in 1 2 3 4 5 6; do
+  systemctl is-active --quiet slurmdbd && break
+  sleep 2
+done
+
+if ! systemctl is-active --quiet slurmdbd; then
+  echo
+  if journalctl -u slurmdbd --since "$DBD_SINCE" --no-pager 2>/dev/null | grep -q "schema is too old"; then
+    echo "    !! accounting DB has an old schema (created by Slurm < 23.11)."
+    echo "       Re-run with:  RESET_ACCT_DB=1 sudo -E bash \$0"
+    echo "       This DELETES accounting history - acceptable for a POC."
+  else
+    echo "    !! slurmdbd failed to start:"
+    journalctl -u slurmdbd --since "$DBD_SINCE" --no-pager 2>/dev/null | tail -15
+  fi
+  exit 1
+fi
 # wait for slurmdbd to actually accept connections before any sacctmgr call.
-# Timeout every probe: sacctmgr can block indefinitely if the daemon is up
-# but not yet serving, which would hang the script.
-for i in $(seq 1 30); do
+# Every probe is timeout-bounded: sacctmgr can block ~20s on a DNS SRV
+# lookup when slurm.conf is missing, and 30 of those would hang the script.
+DBD_OK=0
+for i in $(seq 1 20); do
   systemctl is-active --quiet slurmdbd || { sleep 1; continue; }
-  if timeout 5 sacctmgr -n show cluster >/dev/null 2>&1; then break; fi
+  if timeout 8 sacctmgr -n show cluster >/dev/null 2>&1; then DBD_OK=1; break; fi
   sleep 1
 done
-systemctl is-active --quiet slurmdbd || { journalctl -u slurmdbd -n 15 --no-pager; exit 1; }
-timeout 10 sacctmgr -n show cluster >/dev/null 2>&1 \
-  && echo "    slurmdbd OK (accepting connections)" \
-  || { echo "    !! slurmdbd up but not answering - aborting before sacctmgr spam"
-       journalctl -u slurmdbd -n 15 --no-pager; exit 1; }
+if [[ "$DBD_OK" != "1" ]]; then
+  echo "    !! slurmdbd is up but not answering sacctmgr."
+  echo "       Check that /etc/slurm/slurm.conf exists and names the cluster:"
+  ls -l /etc/slurm/slurm.conf 2>/dev/null || echo "       (missing!)"
+  echo "       And that slurmdbd is listening:"
+  ss -tlnp 2>/dev/null | grep 6819 || echo "       (nothing on 6819)"
+  journalctl -u slurmdbd --since "$DBD_SINCE" --no-pager 2>/dev/null | tail -10
+  exit 1
+fi
+echo "    slurmdbd OK (accepting connections)"
 
 # ---------------------------------------------------------------
 # 5. Detect hardware for NodeName lines
