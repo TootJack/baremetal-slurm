@@ -3,6 +3,10 @@
 Bare-metal Slurm cluster for the MLOps POC on 2 × 8×H200 (i3D.net).
 Jobs run as **sqsh containers** (Pyxis + Enroot) — no environment modules.
 
+> **Just want to run a job?** Read **[USER-GUIDE.md](USER-GUIDE.md)**. It is
+> written for ML engineers and contains no admin content.
+> This README documents the deployment for whoever maintains the cluster.
+
 ## Cluster facts (measured 2026-09-16)
 
 | | hgx01 | hgx20 |
@@ -40,6 +44,7 @@ Sizeable notes:
 ## Files
 
 ```
+USER-GUIDE.md              *** FOR ML ENGINEERS *** how to submit jobs. No admin content.
 poc.sh                     ONE paste-safe entry point: sync|status|fix|drains|test|containers
                            Use this rather than pasting commands from this README.
 scripts/

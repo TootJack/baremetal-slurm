@@ -176,8 +176,21 @@ do_test() {
     echo
   fi
 
-  local dir="/tmp/poc-test-$$"
-  mkdir -p "$dir"
+  # The job may run on EITHER node, so anything we want to read afterwards must
+  # live on shared storage. Using /tmp made `poc.sh test` print an empty
+  # "--- output ---" section whenever the job landed on the other node (the
+  # file was written to that node's local /tmp). /shared is the cluster-wide
+  # root; fall back to /tmp only if it is genuinely absent.
+  local dir
+  if [[ -d /shared/scratch ]]; then
+    dir="/shared/scratch/poc-test-$$"
+  else
+    dir="/tmp/poc-test-$$"
+    echo "  (no /shared/scratch - using node-local ${dir};"
+    echo "   if the job runs on another node its output will be there, not here)"
+  fi
+  mkdir -p "$dir" 2>/dev/null || { echo "  cannot create ${dir}"; return 1; }
+  chmod 1777 "$dir" 2>/dev/null || true
   if [[ "${gpu_nodes:-0}" == "0" ]]; then
     cat > "${dir}/gpu.sbatch" <<'SBATCH'
 #!/bin/bash
@@ -216,7 +229,21 @@ SBATCH
   done
   hdr "job ${jid} state: ${st:-<none>}"
   echo "--- output ---"
-  cat "poc-gpu-${jid}.out" 2>/dev/null | sed 's/^/  /' || echo "  (no output file)"
+  # Look for the file rather than assuming a name/location: the job may have
+  # run on another node, and a missing file must be SAID, not silently skipped.
+  outf=""
+  for cand in "poc-gpu-${jid}.out" "${dir}/poc-gpu-${jid}.out" \
+              "/shared/scratch/poc-gpu-${jid}.out" "/tmp/poc-gpu-${jid}.out"; do
+    [[ -f "$cand" ]] && { outf="$cand"; break; }
+  done
+  if [[ -n "$outf" ]]; then
+    sed 's/^/  /' < "$outf"
+  else
+    echo "  (no output file found for job ${jid})"
+    echo "  searched: ${dir} , /shared/scratch , /tmp"
+    echo "  job's --output was: $(scontrol show job "$jid" 2>/dev/null \
+      | grep -oE 'StdOut=[^ ]*' | head -1 | cut -d= -f2)"
+  fi
   echo "--- accounting ---"
   # AllocGRES was REMOVED in Slurm 25.11 ("please use AllocTRES"), so using it
   # makes sacct fail outright. AllocTRES carries the gres allocation.
