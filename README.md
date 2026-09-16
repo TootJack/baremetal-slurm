@@ -1,11 +1,14 @@
-# i3D.net H200 Slurm POC — Deployment Scripts
+# i3D.net H200 Slurm POC — Deployment
 
 Bare-metal Slurm cluster for the MLOps POC on 2 × 8×H200 (i3D.net).
 Jobs run as **sqsh containers** (Pyxis + Enroot) — no environment modules.
 
 > **Just want to run a job?** Read **[USER-GUIDE.md](USER-GUIDE.md)**. It is
-> written for ML engineers and contains no admin content.
+> written for ML engineers and contains no deployment content.
 > This README documents the deployment for whoever maintains the cluster.
+
+**Status:** operational. Both nodes `idle`, 16× H200 schedulable,
+containerised jobs verified end to end.
 
 ## Cluster facts (measured 2026-09-16)
 
@@ -25,103 +28,84 @@ Jobs run as **sqsh containers** (Pyxis + Enroot) — no environment modules.
 | Shared FS | **Lustre `/mnt/i3d_20tb`** over IB ✅ | same |
 | Management net | bond0 2×200 GbE LACP = 400 Gb/s | same |
 | sudo | passwordless ✅ | passwordless ✅ |
-| `/shared` | does not exist | does not exist |
+| `/shared` | symlink → `/mnt/i3d_20tb/slurm-poc` | same |
 
-Sizeable notes:
-- Both nodes sit on the **same subnet `10.100.18.0/24`** on `bond0`, so they can
-  reach each other over IP — `ssh hgx02` failed only because the hostname was
-  misspelled (`hgx20`) and there was no `/etc/hosts` entry. `01-base.sh` now
-  writes both entries.
+Notes:
+- Both nodes sit on the **same subnet `10.100.18.0/24`** on `bond0`, so they
+  reach each other over IP. `01-base.sh` writes both `/etc/hosts` entries.
 - **The IB fabric is UP.** All 8 ConnectX-7 ports read `4: ACTIVE` with
   `LINK_UP`, `link_layer = InfiniBand`, LIDs assigned and `sm_lid 1` — a subnet
-  manager is running upstream on i3D's side (not locally, which is normal).
+  manager runs upstream on i3D's side (not locally, which is normal).
   `ip link` showing `ibp*` as `DOWN` is only the netdev state for an IPoIB
   interface with no IP configured; the RDMA path is fully functional.
-- **Lustre is mounted at `/mnt/i3d_20tb` and shared between both nodes**, and
-  it runs over the IB fabric (`...@o2ib:/scratch`, `ko2iblnd` loaded).
-  Scripts use it automatically instead of a local `/shared`.
+- **Lustre is mounted at `/mnt/i3d_20tb` and shared between both nodes**, over
+  the IB fabric (`...@o2ib:/scratch`, `ko2iblnd` loaded). Scripts use it
+  automatically. `/shared` is a symlink to it so example `#SBATCH` paths work.
 
 ## Files
 
 ```
-USER-GUIDE.md              *** FOR ML ENGINEERS *** how to submit jobs. No admin content.
-poc.sh                     ONE paste-safe entry point: sync|status|fix|drains|test|containers
-                           Use this rather than pasting commands from this README.
+USER-GUIDE.md              job submission guide for ML engineers
+poc.sh                     operational entry point: sync|status|fix|drains|test|containers
 scripts/
   01-base.sh               OS prep — run on BOTH nodes
   02-users.sh              users + sudo + SSH keys — run on controller
   03-slurm-controller.sh   ctld + dbd + QoS — run on hgx01
   04-slurm-compute.sh      slurmd — run on BOTH nodes
   05-pyxis-enroot.sh       containers — run on BOTH nodes
-  run-on-node.sh           one entry point; tees a log to paste back
+  run-on-node.sh           staged runner (preflight|fabric|controller|containers|verify)
+  lib.sh                   shared helpers (hosts, node detection, staging)
+  slurm-source.sh          build Slurm 25.11.8 from source
+  fabric-verify.sh         IB / shared-FS checks
+  ib-test.sh               RDMA bandwidth
+  lustre-fix.sh            Lustre mount repair
 examples/
-  train-cpt.sbatch         CPT job with checkpoint/requeue
+  train-cpt.sbatch         CPT template (needs your image + entrypoint)
   smoke-container.sbatch   container smoke test
 pubkeys/                   <user>.pub files go here before running 02
-test/                      validation + diagnostics (check-vpn, validate-gres, ...)
+test/                      regression tests and diagnostics
 ```
 
-## Access (why the agent cannot drive this)
+## Operating the cluster
 
-**eduVPN and FortiClient are mutually exclusive** on the admin laptop:
+Use `poc.sh` — one plain word per action. **Do not paste command blocks from
+this file**: pasting a markdown fence into a shell makes bash treat the
+backticks as a command substitution, and it then swallows everything pasted
+after it (`unexpected EOF while looking for matching ``'`), so the session
+appears to hang and later commands silently never run.
 
-| Connected | Node `10.100.18.5` | Agent |
-|---|---|---|
-| eduVPN | ❌ unreachable | ✅ works |
-| FortiClient | ✅ ping 132 ms, port 22 OK | ❌ model times out |
-
-So the operator runs the scripts and pastes the logs back.
-
-## Install order
-
-Scripts auto-detect hostname, CPU, RAM and GPU type. Node 2 is optional until
-it is up.
-
-**Run `./poc.sh`, do not paste commands from this file.** Pasting a markdown
-fence into a shell makes bash treat the ``` ``` ``` as a command
-substitution; it then swallows everything you paste next and appears to hang:
+**The order is not symmetric.** Node 2 announces itself *before* the controller
+is told about it — that removes a deadlock where the controller needed node 2's
+hardware (which only node 2 can measure) while node 2 waited for a `slurm.conf`
+that mentioned it.
 
 ```
-bash: unexpected EOF while looking for matching ``'
-```
-
-That corrupted an hgx01 session and silently skipped a `git pull`. `poc.sh`
-takes one plain word as an argument — nothing to paste wrongly.
-
-**The order matters and is not symmetric.** Node 2 announces itself *before*
-the controller is told about it — that removed a deadlock where the controller
-needed node 2's hardware (which only node 2 can measure) while node 2 waited
-for a `slurm.conf` that mentioned it.
-
-```
-# --- on hgx01 (10.100.18.5) ---
+# --- on hgx01 ---
 cd ~/hengjiantmp/i3d-slurm-poc
 ./poc.sh sync                 # fetch the latest scripts
 ./poc.sh fix                  # 01-base + 03 (controller) + resumes stale drains
 
-# --- on hgx20 (10.100.18.8) ---
+# --- on hgx20 ---
 cd ~/hengjiantmp/i3d-slurm-poc
 ./poc.sh sync
 ./poc.sh fix                  # 01-base + 04 (publishes its own node line)
 
 # --- back on hgx01: add node 2 from the line IT published ---
-./poc.sh fix                  # 03 now sees node-hgx20.conf and includes it
+./poc.sh fix
 
 # --- back on hgx20: the conf now mentions it, so slurmd starts ---
 ./poc.sh fix
 
 # --- either node ---
-./poc.sh status               # paste this whole block back for diagnosis
+./poc.sh status               # read-only health report
 ./poc.sh test                 # a real job end to end
 ./poc.sh containers           # Pyxis + Enroot, on BOTH nodes
 ```
 
-`poc.sh` actions:
-
 | action | what it does |
 |---|---|
 | `sync` | `git pull --ff-only origin main` |
-| `status` | read-only health report: binaries, daemons, hosts, `slurmd -C`, GRES, `sinfo` exit code, node `Reason=`, partition list, recent daemon errors |
+| `status` | read-only report: binaries, daemons, hosts, `slurmd -C`, GRES, `sinfo` exit code, node `Reason=`, partitions, recent daemon errors |
 | `fix` | `01-base.sh`, then `03` (on hgx01, including a second pass with `NODE2_HOST`) or `04` |
 | `drains` | clears stale drains; reports any node still failing validation |
 | `test` | submits a real job, waits for a terminal state, prints output + accounting |
@@ -130,27 +114,25 @@ cd ~/hengjiantmp/i3d-slurm-poc
 
 With no argument it runs `status`, which changes nothing.
 
-> **`verify-hosts-resolution.sh` is not optional on the real nodes.** It is the
-> regression test for bugs 6-7. If it fails, `hgx20` cannot reach the
-> controller regardless of anything else, and `sinfo` on `hgx20` will say
-> `Unable to contact slurm controller (connect failure)`.
-
-`run-on-node.sh` stages: `preflight | fabric | controller | containers | verify`
-Everything is teed to `/tmp/poc-<stage>-<ts>.log`.
+`run-on-node.sh` remains available for staged runs
+(`preflight | fabric | controller | containers | verify`), teeing to
+`/tmp/poc-<stage>-<ts>.log`.
 
 ## GRES
 
-`03` derives the GPU type from `nvidia-smi --query-gpu=name` → `nvidia_h200`.
-Slurm must detect the same `Type`, or it registers fewer GPUs than configured
-and **DRAINs the node**. Override if needed:
+`03` takes the GPU type and count from `slurmd -C`'s own `Gres=` field — the
+exact value slurmctld compares against. It never guesses from `nvidia-smi`: if
+`slurmd` cannot see the GPU via NVML, configuring any count registers fewer
+GPUs than configured and **DRAINs the node**.
+
+Confirm on a node before trusting the output:
 
 ```bash
-GPU_TYPE=h200 sudo -E bash scripts/03-slurm-controller.sh
+slurmd -G          # must NOT say "lib wasn't found"
+slurmd -C          # must include Gres=gpu:nvidia_h200:8
 ```
 
-`preflight` prints both values so they can be compared.
-
-## Verify multi-node BEFORE installing Slurm
+## Verify multi-node
 
 ```bash
 # on both nodes (no coordination needed)
@@ -167,9 +149,15 @@ Go/no-go for multi-node:
 - [ ] Lustre visible and writable on BOTH nodes (a `verify-<otherhost>-*`
       file appearing proves it is genuinely shared)
 
-## Fabric verification result (2026-09-16)
+Hostname resolution is the one thing to check on every node — if a cluster name
+resolves to `127.0.1.1`, Slurm will never reach the controller:
 
-Run on both nodes — **all three gates PASS**:
+```bash
+getent ahostsv4 hgx01 hgx20      # must show 10.100.18.5 / 10.100.18.8
+bash test/verify-hosts-resolution.sh
+```
+
+## Fabric verification result (2026-09-16)
 
 | Check | hgx01 | hgx20 |
 |---|---|---|
@@ -177,8 +165,7 @@ Run on both nodes — **all three gates PASS**:
 | IB fabric | ✅ 8 ports ACTIVE | ✅ 8 ports ACTIVE |
 | IB rate | **400 Gb/s (4X NDR)** | **400 Gb/s (4X NDR)** |
 | Lustre mounted | ✅ | ✅ |
-| Lustre writable | ❌ | ❌ |
-| node→node ssh | ❌ | ❌ |
+| Lustre writable | ✅ (after `lustre-fix.sh`) | ✅ |
 
 **RDMA data path proven: 182.74 Gb/s** (identical on both ends).
 
@@ -193,17 +180,91 @@ Run on both nodes — **all three gates PASS**:
 - To measure the native 400G rails: `bash scripts/ib-test.sh server|client <ip>`
   (assigns a temporary IP, measures, removes it).
 
-### Known gaps before Slurm install
+## Build: SLURM_MODE=source — Slurm 25.11.8
 
-1. **Lustre not writable** → `sudo bash scripts/lustre-fix.sh diag` then `fix`.
-2. **node→node ssh fails** → `04-slurm-compute.sh` no longer needs it: `03`
-   publishes `munge.key` + `slurm.conf` to `<shared>/cluster-config`, so node 2
-   just reads them. Install `02-users.sh` keys later if you want direct ssh.
+`03`/`04` accept `SLURM_MODE` (default `source`). It builds Slurm **25.11.8**
+to `/opt/slurm` on both nodes via `scripts/slurm-source.sh`.
 
-## Bugs found and fixed by actually RUNNING the scripts (2026-09-16)
+```bash
+# controller (hgx01)
+sudo -E SLURM_MODE=source bash scripts/03-slurm-controller.sh
+# compute (hgx20)
+sudo -E SLURM_MODE=source bash scripts/04-slurm-compute.sh
+# containers, both nodes
+sudo bash scripts/05-pyxis-enroot.sh
+```
+
+### Why source, not the vendor/distro stack
+
+| | Version | Problem |
+|---|---|---|
+| Vendor (`slurm23.02-client ... cm10.0`) | 23.02 | Lacks SOW features |
+| Ubuntu `slurm-wlm` | **21.08.5** | Too old; `HAVE_NVML` undefined → GRES silently broken |
+| **Source build** | **25.11.8** | `HAVE_NVML 1` verified; matches the SOW/Slinky target |
+
+### Build facts (measured)
+
+- **~90 s** to compile; download is 6.5 MB.
+- Requires `pkg-config`, `libpmix-dev`, `libjson-c-dev`, `libhdf5-dev`,
+  `libmariadb-dev`, and **`libnvidia-ml-dev`** (provides `nvml.h`).
+- **Without `libnvidia-ml-dev`, `HAVE_NVML` is UNDEFINED** and GPU GRES
+  silently fails — `slurm-source.sh` verifies and refuses to install.
+- Pyxis builds against the Slurm version that will load it. A mismatch makes
+  `slurmd` **refuse to start entirely**, not merely skip the plugin.
+
+### Problems found and fixed by running it
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `HAVE_NVML` undefined | `nvml.h` missing | install `libnvidia-ml-dev`, verify the define |
+| `Exception caught: rsmi_init` | distro `rocm_smi` autodetected, no AMD GPU | `--without-rsmi` |
+| `sacctmgr: fetch_config: DNS SRV lookup failed` (20 s hang) | `/etc/slurm/slurm.conf` written **after** the dbd probe | seed a minimal config before probing |
+| `fatal: Database schema is too old` | DB created by Slurm 21.08/23.11 | `RESET_ACCT_DB=1` (drops history) |
+| `slurmdbd` "Deactivated successfully" with no error | no `PidFile`; `Type=forking` lost the daemon | `Type=simple` + `-D` |
+| `fatal: /sys/fs/cgroup is not a valid cgroup2 mountpoint` | forced `cgroup/v2` when only hybrid cgroups exist | detect with `stat -fc %T`, fall back to `cgroup/v1` |
+| `slurmd initialization failed` | Pyxis built against 23.11: *"Incompatible Slurm plugin version"* | rebuild Pyxis when Slurm changes; stamp `.built-against` |
+
+## Vendor-stack landmines (found on hgx01)
+
+Removing the vendor Slurm leaves configuration pointing at the **deleted**
+tree. These are now handled automatically.
+
+### 1. `munge` fails: vendor `OPTIONS` overrides the key path
+
+```
+Process: ExecStart=/usr/sbin/munged --key-file=/cm/shared/apps/slurm/var/munge/keys/munge.key
+```
+
+The Ubuntu munge unit expands `$OPTIONS` from `/etc/default/munge`, and the
+vendor stack pointed that at the tree we removed — so `munged` exits 1 and the
+whole cluster stops authenticating. Neutralising `/etc/default/munge` was not
+enough: the vendor `--key-file` survived via drop-ins.
+
+**Fix:** `03`/`04` write a complete `/etc/systemd/system/munge.service` with a
+hardcoded `ExecStart` and **no `EnvironmentFile` / `$OPTIONS`**. Nothing left
+behind can override a hardcoded ExecStart.
+
+*Verified against a hostile state:* `OPTIONS` in `/etc/default/munge` **plus**
+a drop-in injecting `Environment=OPTIONS=...` → before: `failed`; after:
+`active`, `STATUS: Success`.
+
+### 2. Stale systemd drop-ins for slurmctld/slurmdbd
+
+`/etc/systemd/system/slurm{ctld,dbd}.service.d/override.conf` silently
+overrides the units we install. `slurm-source.sh` clears them.
+
+### 3. The vendor tree is `/cm/shared/apps/...`
+
+Worth knowing when auditing leftovers:
+
+```bash
+grep -rl "/cm/" /etc/slurm /etc/default /etc/systemd/system 2>/dev/null
+```
+
+## Bugs found and fixed by actually RUNNING the scripts
 
 `03-slurm-controller.sh` exited printing **nothing**. Root cause and the
-four further defects it hid — all reproduced in a real cluster, all fixed:
+further defects it hid — all reproduced in a real cluster, all fixed:
 
 | # | Bug | Symptom | Fix |
 |---|---|---|---|
@@ -214,270 +275,70 @@ four further defects it hid — all reproduced in a real cluster, all fixed:
 | 5 | GRES type guessed from `nvidia-smi` | node `DRAIN`ed: `gres/gpu count reported lower than configured` | use `slurmd -C`'s own `Gres=`; never invent one |
 | 6 | `/etc/hosts`: Debian's `127.0.1.1 <hostname>` line | own name resolves to **loopback** → `SlurmctldHost=hgx01` binds loopback → other nodes get `Unable to contact slurm controller (connect failure)` | delete the loopback line for cluster names before writing the LAN mapping |
 | 7 | `SlurmctldHost=<name>(<addr>)` pinned an address | replies came from a different address than clients used → `Socket timed out on send/recv operation` | use the bare hostname; let `/etc/hosts` resolve it on every node |
-| 8 | `systemctl enable --now slurmd/slurmctld` on a re-run | daemon kept the **previous** `slurm.conf` → `Node X appears to have a different slurm.conf than the slurmctld`, node stuck `inval` | `enable` + `restart`, so both daemons parse the same file |
+| 8 | `systemctl enable --now slurmd/slurmctld` on a re-run | daemon kept the **previous** `slurm.conf` → `Node X appears to have a different slurm.conf than the slurmctld`, node stuck `inval` | `enable` + `restart` |
 | 9 | state dir cleared partially (left `clustername`, dropped `assoc_usage`) | `fatal: No Assoc usage file (/var/spool/slurmctld/assoc_usage) to recover` | delete the **whole** dir, then verify it is empty |
-| 10 | `detect_node "$NODE2_HOST"` ran `slurmd -C` **locally** | node 2's stanza carried node 1's CPU/RAM/GPU counts → `inval` (INVALID_REG) or failed registration | node 2 publishes its own line to shared storage; the controller **reads** it and refuses to guess |
-| 11 | documented order was a deadlock | 03 wrote a conf without node 2; 04 installed it verbatim → `fatal: Unable to determine this slurmd's NodeName`; only *then* did the docs say to add node 2 | 04 publishes its node line and stops; then 03 adds node 2; then 04 starts slurmd. Order documented as asymmetric + idempotent |
-| 12 | `sinfo ... \|\| sinfo` as the last command under `set -e` | both fail while slurmctld restarts → **03 exits 1 despite succeeding** | report-only, never fatal; `sinfo` retried with a hint |
-| 13 | `resolve_shared_root` sourced the conf file over `SHARED_ROOT` | an explicit `SHARED_ROOT=` override was silently ignored (and untestable) | environment wins over the file |
-| 14 | node physically healthy but stuck `DRAIN` after a failed registration | jobs never run; `ReturnToService` does **not** clear it | `node_mgr.c` only returns a node to service when `IS_NODE_DOWN() && !IS_NODE_INVALID_REG() && ret2service==2` — INVALID_REG is explicitly excluded, so `03` resumes nodes that now register cleanly and leaves genuinely failing ones drained |
-| 15 | state dir holding `clustername` without `assoc_usage` | `fatal: No Assoc usage file ... to recover` — slurmctld crash-loops forever, and a matching cluster name makes it look fine | detect the inconsistent dir and reset it (previous conditions only fired on `RESET_ACCT_DB=1` or a name mismatch) |
-| 16 | pasting a ` ```bash ` fence into the shell | bash treats the backticks as an unterminated command substitution and swallows everything pasted after it (`unexpected EOF while looking for matching ``'`), so the session hangs and later commands silently never run | `poc.sh`: one paste-safe word per action; README no longer instructs pasting commands |
+| 10 | `detect_node "$NODE2_HOST"` ran `slurmd -C` **locally** | node 2's stanza carried node 1's CPU/RAM/GPU counts → `inval` (INVALID_REG) | node 2 publishes its own line to shared storage; the controller **reads** it and refuses to guess |
+| 11 | documented order was a deadlock | 03 wrote a conf without node 2; 04 installed it verbatim → `fatal: Unable to determine this slurmd's NodeName` | 04 publishes its node line and stops; then 03 adds node 2; then 04 starts slurmd |
+| 12 | `sinfo ... \|\| sinfo` as the last command under `set -e` | both fail while slurmctld restarts → **03 exits 1 despite succeeding** | report-only, never fatal |
+| 13 | `resolve_shared_root` sourced the conf file over `SHARED_ROOT` | an explicit `SHARED_ROOT=` override was silently ignored | environment wins over the file |
+| 14 | node physically healthy but stuck `DRAIN` after a failed registration | jobs never run; `ReturnToService` does **not** clear it | `node_mgr.c` only returns a node to service when `IS_NODE_DOWN() && !IS_NODE_INVALID_REG() && ret2service==2` — so `03` resumes nodes that now register cleanly and leaves genuinely failing ones drained |
+| 15 | state dir holding `clustername` without `assoc_usage` | `fatal: No Assoc usage file ... to recover` — slurmctld crash-loops forever, and a matching cluster name makes it look fine | detect the inconsistent dir and reset it |
+| 16 | `NodeName=` line carried no CPU topology | `Reason=gres/gpu GRES autodetected core affinity 0-95 doesn't match socket boundaries (Socket 0 is cores 0-0)`, node `DRAIN+INVALID_REG` | keep `slurmd -C`'s output verbatim (`Boards`, `SocketsPerBoard`, `CoresPerSocket`, `ThreadsPerCore`); omitting `CoresPerSocket` makes slurmctld assume 1 |
+| 17 | `AccountingStorageHost=127.0.0.1` | a compute node tried to reach slurmdbd on **itself** → `sacct`/`squeue` hang on hgx20 | point it at the controller, the address every node resolves identically |
+| 18 | example `#SBATCH` paths used `/shared`, which did not exist | `sbatch` accepted the job then it died at launch with no output | `/shared` symlink to the real shared root (`01-base.sh`) |
 
-Bugs 6-16 are the multi-node blockers: with the full stack installed, `hgx01`
+Bugs 6-18 are the multi-node blockers: with the full stack installed, `hgx01`
 showed the node as `inval` and `hgx20` could not reach the controller at all.
-All are fixed and locked down by `test/verify-hosts-resolution.sh` (11
-assertions), `test/verify-multinode-bootstrap.sh` (11),
-`test/verify-two-node-flow.sh` and `test/verify-03-node2.sh` (refuses to
-invent, then succeeds), plus `test/verify-end-to-end.sh` (clean run → node
-`idle` → submitted job `COMPLETED` → `sacct` reports it).
+All are fixed and locked down by the regression tests:
 
-> **On the real nodes, run `01-base.sh` on BOTH first.** It must print
-> `hostname resolution OK (<node> sees both nodes)`; if it prints
-> `!! ... resolves to '127.0.1.1'` then Slurm will never reach the controller.
+| test | covers |
+|---|---|
+| `verify-hosts-resolution.sh` | `/etc/hosts` mapping, loopback shadow, stray duplicates |
+| `verify-multinode-bootstrap.sh` | node-line publish/read, atomicity |
+| `verify-node-topology.sh` | full CPU topology preserved verbatim |
+| `verify-two-node-flow.sh`, `verify-03-node2.sh` | 03 refuses to invent node 2, then succeeds |
+| `verify-stale-node-line.sh` | rejects a line published without topology |
+| `verify-drain-clear.sh` | stale drain is resumed, still-failing node is not |
+| `verify-inconsistent-state.sh` | cluster recovers from an inconsistent state dir |
+| `verify-shared-and-accounting.sh` | `/shared` and accounting host |
+| `verify-user-guide-commands.sh` | every command in USER-GUIDE.md is valid |
+| `verify-end-to-end.sh` | clean bring-up → node `idle` → job `COMPLETED` |
+
+Also fixed: `sacctmgr` calls are all `timeout`-wrapped (they could block),
+`01-base.sh` repairs half-configured dpkg before `apt-get install` (hgx20 hit
+`E: Unmet dependencies`), NTP uses chrony since `timedatectl set-ntp` reports
+"NTP not supported" on these images, and `04-slurm-compute.sh` no longer
+requires `CTRL_HOST` (Lustre provides the staging area).
 
 > **If a name resolves to the wrong address**, the cause is usually a stray or
 > duplicate `/etc/hosts` line outside the managed block. nsswitch is
 > `files dns`, and within `files` the **first** match wins — so such a line
 > silently beats the block and still resolves "successfully", just wrongly.
-> `01-base.sh` now removes those, printing
-> `removing stray/duplicate mapping(s) for <name>`. To see the sources:
+> `01-base.sh` removes those. To inspect:
 
 ```bash
-# every /etc/hosts line mentioning the cluster names + what each resolves to
 sudo bash -c 'source scripts/lib.sh && show_cluster_hosts_sources'
 ```
 
-Also fixed: `sacctmgr` calls are all `timeout`-wrapped (they could block),
-`01-base.sh` now repairs half-configured dpkg before `apt-get install`
-(hgx20 hit `E: Unmet dependencies`), NTP uses chrony since
-`timedatectl set-ntp` reports "NTP not supported" on these images, and
-`04-slurm-compute.sh` no longer requires `CTRL_HOST` (Lustre provides it).
-
-**Verified:** clean run and re-run both exit 0; node reports `idle`.
-
-### The GRES trap (important for hgx01/hgx20)
-
-Slurm only emits `Gres=` from `slurmd -C` when it can talk to the GPU via
-NVML. If `libnvidia-ml.so.1` is not on the loader path, `slurmd -C` shows
-**no Gres at all** — and configuring any GRES count then DRAINs the node.
-The script now refuses to guess and prints a loud warning instead. On the
-H200 nodes, confirm before trusting the output:
-
-```bash
-slurmd -G          # must NOT say "lib wasn't found"
-slurmd -C          # must include Gres=gpu:nvidia_h200:8
-```
-
-## SLURM_MODE=source — Slurm 25.11.8 from source (chosen)
-
-`03`/`04` now accept `SLURM_MODE` (default `source`). It builds Slurm
-**25.11.8** to `/opt/slurm` on both nodes via `scripts/slurm-source.sh`.
-
-```bash
-# controller (hgx01) - first run also drops the stale accounting DB
-RESET_ACCT_DB=1 sudo -E SLURM_MODE=source bash scripts/03-slurm-controller.sh
-# compute (hgx20)
-sudo -E SLURM_MODE=source bash scripts/04-slurm-compute.sh
-# containers, both nodes
-sudo bash scripts/05-pyxis-enroot.sh
-```
-
-### Why source (and not the vendor/distro stack)
-
-| | Version | Problem |
-|---|---|---|
-| Vendor (`slurm23.02-client ... cm10.0`) | 23.02 | Lacks SOW features; my first attempt *replaced* it |
-| Ubuntu `slurm-wlm` | **21.08.5** | Too old; `HAVE_NVML` undefined → GRES silently broken |
-| **Source build** | **25.11.8** | `HAVE_NVML 1` verified; matches the SOW/Slinky target |
-
-### Build facts (measured)
-
-- **~87 s** to compile on 20 cores; download is 6.5 MB.
-- Requires `pkg-config`, `libpmix-dev`, `libjson-c-dev`, `libhdf5-dev`,
-  `libmariadb-dev`, and **`libnvidia-ml-dev`** (provides `nvml.h`).
-- **Without `libnvidia-ml-dev`, `HAVE_NVML` is UNDEFINED** and GPU GRES
-  silently fails — `slurm-source.sh` verifies and refuses to install.
-
-### Problems found and fixed by running it
-
-| Symptom | Cause | Fix |
-|---|---|---|
-| `HAVE_NVML` undefined | `nvml.h` missing | install `libnvidia-ml-dev`, verify the define |
-| `Exception caught: rsmi_init` | distro `rocm_smi` autodetected, no AMD GPU | `--without-rsmi` |
-| `sacctmgr: fetch_config: DNS SRV lookup failed` (20 s hang) | `/etc/slurm/slurm.conf` written **after** the dbd probe | seed a minimal config before probing |
-| `fatal: Database schema is too old` | DB created by Slurm 21.08/23.11 | `RESET_ACCT_DB=1` (drops history); verified a fresh DB starts fine |
-| `slurmdbd` "Deactivated successfully" with no error | no `PidFile`; `Type=forking` lost the daemon | `Type=simple` + `-D` |
-| `fatal: /sys/fs/cgroup is not a valid cgroup2 mountpoint` | forced `cgroup/v2` when only hybrid cgroups exist | detect with `stat -fc %T`, fall back to `cgroup/v1` |
-| **`slurmd initialization failed`** | Pyxis built against 23.11: *"Incompatible Slurm plugin version (23.11.4)"* | rebuild Pyxis when the Slurm version changes, stamp `.built-against` |
-
-### Verified end state (test cluster)
+## Verified end state
 
 ```
-slurmctld 25.11.8  /  slurmd 25.11.8  /  slurmdbd 25.11.8
-sinfo: node = idle
-daemons: munge, mariadb, slurmdbd, slurmctld, slurmd all active
+Slurm 25.11.8 (source build at /opt/slurm), Pyxis + Enroot
+sinfo:
+  gpu*   up infinite  2  idle  hgx[01,20]
+  debug  up  2:00:00  2  idle  hgx[01,20]
+per node: gpu:nvidia_h200:8(S:0-1)
+daemons: munge, mariadb, slurmdbd, slurmctld, slurmd — all active
+a submitted GPU job completes and is reported by sacct
 ```
-
-Note Pyxis builds against the version of Slurm that will load it — a mismatch
-makes `slurmd` **refuse to start entirely**, not merely skip the plugin.
-
-## Vendor-stack landmines (found on hgx01)
-
-Removing the vendor Slurm leaves configuration pointing at the **deleted**
-tree. These bit us in sequence and are now handled automatically.
-
-### 1. `munge` fails: vendor `OPTIONS` overrides the key path
-
-hgx01 error:
-```
-Job for munge.service failed because the control process exited with error code.
-Process: ExecStart=/usr/sbin/munged --key-file=/cm/shared/apps/slurm/var/munge/keys/munge.key
-```
-
-The Ubuntu munge unit is:
-```
-EnvironmentFile=-/etc/default/munge
-ExecStart=/usr/sbin/munged $OPTIONS
-```
-
-The vendor stack wrote `OPTIONS="--key-file=/cm/shared/apps/slurm/var/munge/keys/munge.key"`
-into `/etc/default/munge`. That path belongs to the vendor tree we removed,
-so `munged` exits 1 and **the whole cluster stops authenticating**.
-
-Fix: `03`/`04` rewrite `/etc/default/munge` to
-`OPTIONS="--key-file=/etc/munge/munge.key"` and clear any
-`munge.service.d/*.conf` drop-ins.
-
-*Reproduced and verified:* vendor `OPTIONS` → `failed`; after fix →
-`active` + `STATUS: Success`.
-
-### 2. Stale systemd drop-ins for slurmctld/slurmdbd
-
-`/etc/systemd/system/slurm{ctld,dbd}.service.d/override.conf` silently
-overrides the units we install. `slurm-source.sh` now clears them.
-
-### 3. The vendor tree is `/cm/shared/apps/...`
-
-Worth knowing when auditing leftovers:
-```bash
-grep -rl "/cm/" /etc/slurm /etc/default /etc/systemd/system 2>/dev/null
-```
-
-### Verified recovery from a fully tainted state
-
-With the vendor `OPTIONS` **and** a stale drop-in planted, `03` completes
-`EXIT=0`, prints `vendor munge OPTIONS found … munge OK`, and all five
-daemons end active with the node `idle`.
-
-## The munge vendor trap — SOLVED (definitively)
-
-hgx01 kept failing even after rewriting `/etc/default/munge`:
-
-```
-Process: ExecStart=/usr/sbin/munged --key-file=/cm/shared/apps/slurm/var/munge/keys/munge.key
-```
-
-The vendor `--key-file` survived every attempt to neutralise it via
-`/etc/default/munge`, because **we could not identify which layer injected
-it**. Guessing was the wrong approach.
-
-### Fix: replace the unit outright
-
-`03`/`04` now write a complete `/etc/systemd/system/munge.service` that
-**has no `EnvironmentFile` and does not expand `$OPTIONS`**:
-
-```ini
-ExecStart=/usr/sbin/munged --key-file=/etc/munge/munge.key
-```
-
-Nothing the vendor left behind can override a hardcoded ExecStart.
-
-*Verified against a hostile state:* `OPTIONS` in `/etc/default/munge`
-**plus** a drop-in injecting `Environment=OPTIONS=...` →
-before: `failed` (effective `ExecStart=... $OPTIONS`);
-after: `active`, `STATUS: Success`.
-
-### Also fixed while proving it
-
-| Bug | Symptom |
-|---|---|
-| bare `systemctl restart munge` under `set -e` | **aborted the script before diagnostics could print** — which is why the failure looked silent |
-| `clustername` compared to raw file contents | Slurm stores `i3dpoc\|1632`, so the guard archived state every run → `slurmctld activating` |
-
-Verified end state with the vendor config planted:
-
-```
-munge active | mariadb active | slurmdbd active | slurmctld active | slurmd active
-[node] idle
-EXIT=0
-```
-
-## GPU GRES CONFIRMED on the H200 nodes ✅
-
-```
-hgx01: slurmd -C → NodeName=hgx01 ... Gres=gpu:nvidia_h200:8
-                   Found gpu:nvidia_h200:8 with Autodetect=nvml
-hgx20: slurmd -C → ... Gres=gpu:nvidia_h200:8
-```
-
-`HAVE_NVML 1` at build time **and** working NVML at runtime on both nodes.
-Jobs requesting `--gres=gpu` will schedule.
-
-## Remaining fixes from the hgx01/hgx20 run
-
-### 1. `inval` state: `fatal: CLUSTER ID MISMATCH`
-
-The node sat in `inval` because:
-
-```
-slurmctld has been started with "ClusterID=3744" from the state files,
-but the DBD thinks it should be "1540".
-```
-
-`RESET_ACCT_DB=1` mints a **new ClusterID**, but the old `/var/spool/slurmctld`
-survives. My guard only compared `ClusterName`, missing the ID. Now:
-
-- the file is parsed as `<ClusterName>|<ClusterID>` (not compared raw)
-- `RESET_ACCT_DB=1` **also clears the state dir**, so the ID matches
-
-*Verified:* stale state + fresh DB → `slurmd`/`slurmctld` start, node `idle`.
-
-### 2. Bare `sinfo`/`slurmd` resolved to the wrong Slurm
-
-On hgx20, bare `slurmd -C` printed **no Gres** and `sinfo` failed with
-"Unable to contact slurm controller" — while `export PATH=/opt/slurm/sbin`
-made both work. Cause: `/etc/profile.d` only loads for **login** shells, so
-interactive `sudo` sessions fell back to the distro 21.08 client, which
-cannot talk to a 25.11 daemon (protocol mismatch).
-
-Fix in `slurm-source.sh`:
-- symlink every `/opt/slurm/{bin,sbin}/*` into `/usr/local/bin`
-  (precedes `/usr/bin` in the default PATH, and works under `sudo`)
-- remove the distro `slurm*` packages that shadow it
-
-### 3. `enroot import` failed as `nobody`
-
-```
-mkdir: cannot create directory '/tmp/enroot-data/65534': Permission denied
-FATAL ERROR: Could not read $HOME, use -recovery-path
-```
-
-`nobody` (uid 65534) has no home. `05` now imports as a real user
-(`mluser1`/`ubuntu`/`slurmadmin`) and pre-creates the enroot dirs
-world-writable. Import as root is the fallback, and the resulting `.sqsh`
-is verified readable with `unsquashfs -l`.
 
 ## Next
 
-```bash
-git pull    # both nodes
-# hgx01: reset DB + state together, now a single flag
-RESET_ACCT_DB=1 sudo -E SLURM_MODE=source bash scripts/03-slurm-controller.sh
-NODE2_HOST=hgx20 RESET_ACCT_DB=1 sudo -E SLURM_MODE=source bash scripts/03-slurm-controller.sh
-# hgx20
-sudo -E SLURM_MODE=source bash scripts/04-slurm-compute.sh
-# both
-sudo bash scripts/05-pyxis-enroot.sh
-sinfo -N -o "%N %T %C %G"     # expect: hgx01 idle, hgx20 idle, gpu:nvidia_h200:8
-```
+The platform is complete. What remains is the benchmark deliverable, which
+needs a real training stack:
+
+1. Build a container image once:
+   `enroot import -o /shared/containers/pytorch.sqsh docker://nvcr.io#nvidia/pytorch:24.07-py3`
+2. Point `examples/train-cpt.sbatch` at your entrypoint (it is a template — it
+   exits with a clear message until the image and `train.py` exist).
+3. For a no-container smoke test now: `./poc.sh test`

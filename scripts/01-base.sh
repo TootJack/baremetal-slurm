@@ -138,7 +138,6 @@ EOF
 
 # ---------------------------------------------------------------
 # 6. SSH hardening: key auth only, no root password login
-#    Access is via FortiClient VPN + ed25519 keys (no Tailscale for a 30-day POC)
 # ---------------------------------------------------------------
 echo "==> Configuring sshd: pubkey auth on, password auth off"
 SSHD_CONFIG="/etc/ssh/sshd_config"

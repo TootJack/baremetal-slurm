@@ -1,15 +1,12 @@
 #!/usr/bin/env bash
 # =====================================================================
-# run-on-node.sh - ONE command to run on the bare-metal node.
+# run-on-node.sh - staged runner for the bare-metal nodes.
 #
-# Since the agent cannot reach the node (eduVPN and FortiClient are
-# mutually exclusive on the laptop), this collects everything into a
-# single log you paste back.
+# Runs one stage of the deployment and tees everything to a single log,
+# which makes a failed run easy to hand over for diagnosis.
 #
 # Usage (on the node, as ubuntu):
-#     curl -fsSL <raw-url> | bash -s -- preflight
-# or after copying the repo:
-#     bash scripts/run-on-node.sh preflight|controller|all
+#     bash scripts/run-on-node.sh preflight|fabric|controller|containers|verify
 #
 # Output goes to stdout AND a file: /tmp/poc-<stage>-<ts>.log
 # =====================================================================
@@ -19,7 +16,7 @@ STAGE="${1:-preflight}"
 TS="$(date +%Y%m%d-%H%M%S)"
 LOG="/tmp/poc-${STAGE}-${TS}.log"
 
-# tee everything so the user can paste the tail
+# tee everything so a failed run leaves a complete log
 exec > >(tee -a "$LOG") 2>&1
 
 hr() { printf '\n========== %s ==========\n' "$*"; }

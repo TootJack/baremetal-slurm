@@ -13,7 +13,7 @@
 #
 # Usage (run as your normal user; the script uses sudo where needed):
 #   ./poc.sh sync      - fetch the latest scripts from git
-#   ./poc.sh status    - full cluster health report (paste this back)
+#   ./poc.sh status    - full cluster health report for diagnosis
 #   ./poc.sh fix       - re-run the controller/compute setup and clear drains
 #   ./poc.sh test      - run a real GPU job end to end
 #   ./poc.sh containers- install Pyxis+Enroot on this node
@@ -91,7 +91,7 @@ do_status() {
   journalctl -u slurmctld --since '5 min ago' --no-pager 2>/dev/null | grep -iE 'error|fatal' | grep -viE 'environment|MailProg' | tail -5 | sed 's/^/  /'
   journalctl -u slurmd --since '5 min ago' --no-pager 2>/dev/null | grep -iE 'error|fatal' | grep -viE 'environment' | tail -5 | sed 's/^/  /'
 
-  hdr "done - paste this whole block back"
+  hdr "done"
 }
 
 # ---------------------------------------------------------------------
@@ -266,7 +266,7 @@ show_usage() {
   echo "usage: $SELF {sync|status|fix|drains|test|containers|help}"
   echo
   echo "  sync        fetch the latest scripts from git"
-  echo "  status      full cluster health report (read-only; paste this back)"
+  echo "  status      full cluster health report (read-only)"
   echo "  fix         re-run 01-base plus 03 (on hgx01) or 04 (elsewhere)"
   echo "  drains      clear stale drains, reporting any node still failing"
   echo "  test        run a real job end to end (GPU if any node advertises one)"
