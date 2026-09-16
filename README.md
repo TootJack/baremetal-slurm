@@ -40,6 +40,8 @@ Sizeable notes:
 ## Files
 
 ```
+poc.sh                     ONE paste-safe entry point: sync|status|fix|drains|test|containers
+                           Use this rather than pasting commands from this README.
 scripts/
   01-base.sh               OS prep — run on BOTH nodes
   02-users.sh              users + sudo + SSH keys — run on controller
@@ -70,46 +72,58 @@ So the operator runs the scripts and pastes the logs back.
 Scripts auto-detect hostname, CPU, RAM and GPU type. Node 2 is optional until
 it is up.
 
+**Run `./poc.sh`, do not paste commands from this file.** Pasting a markdown
+fence into a shell makes bash treat the ``` ``` ``` as a command
+substitution; it then swallows everything you paste next and appears to hang:
+
+```
+bash: unexpected EOF while looking for matching ``'
+```
+
+That corrupted an hgx01 session and silently skipped a `git pull`. `poc.sh`
+takes one plain word as an argument — nothing to paste wrongly.
+
 **The order matters and is not symmetric.** Node 2 announces itself *before*
 the controller is told about it — that removed a deadlock where the controller
 needed node 2's hardware (which only node 2 can measure) while node 2 waited
 for a `slurm.conf` that mentioned it.
 
-```bash
+```
 # --- on hgx01 (10.100.18.5) ---
 cd ~/hengjiantmp/i3d-slurm-poc
-bash scripts/run-on-node.sh preflight        # already done ✅
-bash scripts/run-on-node.sh fabric           # check IB / shared FS
-sudo bash scripts/01-base.sh                 # writes /etc/hosts, sysctls, sshd
-sudo bash scripts/03-slurm-controller.sh     # controller, single node to start
+./poc.sh sync                 # fetch the latest scripts
+./poc.sh fix                  # 01-base + 03 (controller) + resumes stale drains
 
 # --- on hgx20 (10.100.18.8) ---
 cd ~/hengjiantmp/i3d-slurm-poc
-sudo bash scripts/01-base.sh
-sudo bash scripts/04-slurm-compute.sh
-#   04 publishes hgx20's OWN NodeName line to /mnt/i3d_20tb/slurm-poc/
-#   cluster-config/node-hgx20.conf (CPU/RAM/GPU counts only hgx20 can
-#   measure) and then refuses to start slurmd until the controller's
-#   slurm.conf mentions hgx20. Running it twice is expected and safe:
-#   first run publishes + tells you to configure the controller.
+./poc.sh sync
+./poc.sh fix                  # 01-base + 04 (publishes its own node line)
 
-# --- back on hgx01: add node 2 using ITS OWN published line ---
-NODE2_HOST=hgx20 sudo -E bash scripts/03-slurm-controller.sh
+# --- back on hgx01: add node 2 from the line IT published ---
+./poc.sh fix                  # 03 now sees node-hgx20.conf and includes it
 
-# --- back on hgx20: now the conf mentions it ---
-sudo bash scripts/04-slurm-compute.sh
+# --- back on hgx20: the conf now mentions it, so slurmd starts ---
+./poc.sh fix
 
-# --- on BOTH nodes: containers / sqsh ---
-sudo bash scripts/05-pyxis-enroot.sh
-
-# --- on BOTH nodes (after 01-base.sh) ---
-sudo bash test/verify-hosts-resolution.sh    # 11 assertions; MUST be all-PASS
-
-
-# --- verify (hgx01) ---
-sinfo -N -o "%N %T %C %G"
-bash scripts/run-on-node.sh verify
+# --- either node ---
+./poc.sh status               # paste this whole block back for diagnosis
+./poc.sh test                 # a real job end to end
+./poc.sh containers           # Pyxis + Enroot, on BOTH nodes
 ```
+
+`poc.sh` actions:
+
+| action | what it does |
+|---|---|
+| `sync` | `git pull --ff-only origin main` |
+| `status` | read-only health report: binaries, daemons, hosts, `slurmd -C`, GRES, `sinfo` exit code, node `Reason=`, partition list, recent daemon errors |
+| `fix` | `01-base.sh`, then `03` (on hgx01, including a second pass with `NODE2_HOST`) or `04` |
+| `drains` | clears stale drains; reports any node still failing validation |
+| `test` | submits a real job, waits for a terminal state, prints output + accounting |
+| `containers` | `05-pyxis-enroot.sh` |
+| `help` | usage |
+
+With no argument it runs `status`, which changes nothing.
 
 > **`verify-hosts-resolution.sh` is not optional on the real nodes.** It is the
 > regression test for bugs 6-7. If it fails, `hgx20` cannot reach the
